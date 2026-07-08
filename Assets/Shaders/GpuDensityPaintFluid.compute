@@ -1,0 +1,924 @@
+﻿#pragma kernel KernelClearGrid
+#pragma kernel KernelSplatDensity
+#pragma kernel KernelSimulate
+#pragma kernel KernelClearStats
+#pragma kernel KernelCountStats
+#pragma kernel KernelApplyRuntimeColor
+#pragma kernel KernelClearDrainCounter
+#pragma kernel KernelClearPaintImpactCount
+
+struct PaintParticle
+{
+    float4 positionState;
+    float4 velocityRadius;
+    float4 colorSeed;
+};
+
+struct PaintImpact
+{
+    float4 uvRadius;
+    float4 colorAmount;
+    float4 tangentVelocity;
+};
+
+RWStructuredBuffer<PaintParticle> _Particles;
+RWStructuredBuffer<float4> _RestPositions;
+RWStructuredBuffer<uint> _GridCounts;
+RWStructuredBuffer<uint> _Stats;
+RWStructuredBuffer<uint> _DrainCounter;
+RWStructuredBuffer<PaintImpact> _PaintImpacts;
+RWStructuredBuffer<uint> _PaintImpactCount;
+
+int _ParticleCount;
+int _GridResolution;
+int _TotalCells;
+int _DrainParticleBudget;
+int _MaximumPaintImpacts;
+
+float _VolumePerParticleLiters;
+float _UseStage04CanvasPainting;
+
+float _DeltaTime;
+float _SimulationTime;
+
+float _BottomY;
+float _BucketHeight;
+float _BottomRadius;
+float _TopRadius;
+float _CurrentFillHeight;
+float _InitialFillHeight;
+float _ParticleRadius;
+float _HoleRadius;
+float _AllowDrain;
+float _Viscosity01;
+float _PressureStrength;
+float _WallFriction;
+float _ShapeSupportStrength;
+float _DrainSuctionStrength;
+float _VortexStrength;
+float _DrainInfluenceRadius;
+float _DrainInfluenceHeight;
+float _StreamRenderRadiusScale;
+float _DepositedRadiusScale;
+float _ExitSpeed;
+
+float3 _Gravity;
+float3 _BucketVelocity;
+float3 _BucketAcceleration;
+float3 _HoleLocal;
+float3 _ExitDirectionWorld;
+
+float4x4 _BucketLocalToWorld;
+float4x4 _BucketWorldToLocal;
+
+float _HasCanvas;
+float4x4 _CanvasLocalToWorld;
+float4x4 _CanvasWorldToLocal;
+float3 _CanvasPositionWorld;
+float3 _CanvasNormalWorld;
+float4 _CanvasHalfSize;
+float _CanvasSurfaceOffset;
+float _CanvasAdhesion;
+float _CanvasFlowMobility;
+float _CanvasImpactSpread;
+float _CanvasTangentialDamping;
+float _EdgeReleaseSpeed;
+
+float4 _CurrentPaintColor;
+int _ColorApplyMode;
+
+float RadiusAtY(float y)
+{
+    float t = saturate(
+        (y - _BottomY) /
+        max(0.0001, _BucketHeight)
+    );
+
+    return lerp(_BottomRadius, _TopRadius, t);
+}
+
+int3 LocalToCell(float3 p)
+{
+    float maxRadius = max(_TopRadius, _BottomRadius);
+
+    float nx = (p.x / maxRadius) * 0.5 + 0.5;
+    float ny = (p.y - _BottomY) / max(0.0001, _BucketHeight);
+    float nz = (p.z / maxRadius) * 0.5 + 0.5;
+
+    return (int3)floor(
+        float3(nx, ny, nz) * (_GridResolution - 1)
+    );
+}
+
+bool ValidCell(int3 c)
+{
+    return
+        c.x >= 0 &&
+        c.y >= 0 &&
+        c.z >= 0 &&
+        c.x < _GridResolution &&
+        c.y < _GridResolution &&
+        c.z < _GridResolution;
+}
+
+uint CellIndex(int3 c)
+{
+    return (uint)(
+        c.x +
+        c.y * _GridResolution +
+        c.z * _GridResolution * _GridResolution
+    );
+}
+
+uint SampleCount(int3 c)
+{
+    if (!ValidCell(c))
+        return 0;
+
+    return _GridCounts[CellIndex(c)];
+}
+
+float2 SafeNormalize2(float2 value)
+{
+    float magnitudeSquared = dot(value, value);
+
+    if (magnitudeSquared < 0.0000001)
+        return float2(0, 0);
+
+    return value * rsqrt(magnitudeSquared);
+}
+
+[numthreads(256, 1, 1)]
+void KernelClearGrid(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_TotalCells)
+        return;
+
+    _GridCounts[id] = 0;
+}
+
+[numthreads(1, 1, 1)]
+void KernelClearDrainCounter(uint id : SV_DispatchThreadID)
+{
+    _DrainCounter[0] = 0;
+}
+
+[numthreads(1, 1, 1)]
+void KernelClearPaintImpactCount(uint id : SV_DispatchThreadID)
+{
+    _PaintImpactCount[0] = 0;
+}
+
+[numthreads(256, 1, 1)]
+void KernelSplatDensity(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_ParticleCount)
+        return;
+
+    PaintParticle particle = _Particles[id];
+    float state = particle.positionState.w;
+
+    if (state < 0.5 || state >= 1.5)
+        return;
+
+    int3 cell = LocalToCell(particle.positionState.xyz);
+
+    if (!ValidCell(cell))
+        return;
+
+    uint oldValue;
+
+    InterlockedAdd(
+        _GridCounts[CellIndex(cell)],
+        1,
+        oldValue
+    );
+}
+
+[numthreads(256, 1, 1)]
+void KernelSimulate(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_ParticleCount)
+        return;
+
+    PaintParticle particle = _Particles[id];
+    float state = particle.positionState.w;
+
+    if (state < 0.5)
+        return;
+
+    float dt = min(_DeltaTime, 0.016);
+    float3 position = particle.positionState.xyz;
+    float3 velocity = particle.velocityRadius.xyz;
+
+    if (state < 1.5)
+    {
+        particle.colorSeed.rgb = _CurrentPaintColor.rgb;
+
+        float3 effectiveWorldGravity =
+            _Gravity -
+            _BucketAcceleration * 0.30;
+
+        float3 localGravity =
+            mul(
+                _BucketWorldToLocal,
+                float4(effectiveWorldGravity, 0)
+            ).xyz;
+
+        velocity += localGravity * dt;
+
+        float3 originalRest = _RestPositions[id].xyz;
+
+        float normalizedOriginalHeight =
+            saturate(
+                (originalRest.y - _BottomY) /
+                max(0.0001, _InitialFillHeight)
+            );
+
+        float3 currentRestTarget = originalRest;
+
+        currentRestTarget.y =
+            _BottomY +
+            normalizedOriginalHeight *
+            _CurrentFillHeight;
+
+        velocity +=
+            (currentRestTarget - position) *
+            _ShapeSupportStrength *
+            dt;
+
+        int3 cell = LocalToCell(position);
+
+        float centerCount =
+            max(
+                1.0,
+                (float)SampleCount(cell)
+            );
+
+        float countXP = (float)SampleCount(cell + int3(1, 0, 0));
+        float countXM = (float)SampleCount(cell + int3(-1, 0, 0));
+        float countYP = (float)SampleCount(cell + int3(0, 1, 0));
+        float countYM = (float)SampleCount(cell + int3(0, -1, 0));
+        float countZP = (float)SampleCount(cell + int3(0, 0, 1));
+        float countZM = (float)SampleCount(cell + int3(0, 0, -1));
+
+        float3 densityGradient =
+            float3(
+                countXP - countXM,
+                countYP - countYM,
+                countZP - countZM
+            ) /
+            centerCount;
+
+        velocity -=
+            densityGradient *
+            _PressureStrength *
+            dt;
+
+        float viscosityDamping =
+            lerp(
+                0.8,
+                11.0,
+                saturate(_Viscosity01)
+            );
+
+        velocity *= exp(-viscosityDamping * dt);
+
+        if (
+            _AllowDrain > 0.5 &&
+            _HoleRadius > 0.000001
+        )
+        {
+            float heightAboveBottom =
+                max(0.0, position.y - _BottomY);
+
+            float2 toHoleVector =
+                _HoleLocal.xz -
+                position.xz;
+
+            float distanceToHole = length(toHoleVector);
+
+            float radialInfluence =
+                saturate(
+                    1.0 -
+                    distanceToHole /
+                    max(0.0001, _DrainInfluenceRadius)
+                );
+
+            float verticalInfluence =
+                saturate(
+                    1.0 -
+                    heightAboveBottom /
+                    max(0.0001, _DrainInfluenceHeight)
+                );
+
+            float drainInfluence =
+                radialInfluence *
+                verticalInfluence;
+
+            float2 directionToHole =
+                SafeNormalize2(toHoleVector);
+
+            velocity.xz +=
+                directionToHole *
+                _DrainSuctionStrength *
+                drainInfluence *
+                dt;
+
+            velocity.y -=
+                _DrainSuctionStrength *
+                0.38 *
+                drainInfluence *
+                dt;
+
+            float lowFillAmount =
+                1.0 -
+                saturate(
+                    _CurrentFillHeight /
+                    max(0.0001, _InitialFillHeight)
+                );
+
+            float2 tangentDirection =
+                float2(
+                    -directionToHole.y,
+                    directionToHole.x
+                );
+
+            float seedVariation =
+                0.82 +
+                sin(
+                    _SimulationTime * 1.7 +
+                    particle.colorSeed.w * 6.283185
+                ) *
+                0.18;
+
+            velocity.xz +=
+                tangentDirection *
+                _VortexStrength *
+                drainInfluence *
+                lowFillAmount *
+                seedVariation *
+                dt;
+        }
+
+        position += velocity * dt;
+
+        float allowedRadius =
+            RadiusAtY(position.y) -
+            _ParticleRadius;
+
+        allowedRadius =
+            max(_ParticleRadius, allowedRadius);
+
+        float radialDistance = length(position.xz);
+
+        if (radialDistance > allowedRadius)
+        {
+            float2 wallNormal =
+                radialDistance > 0.0001
+                    ? position.xz / radialDistance
+                    : float2(1, 0);
+
+            position.xz = wallNormal * allowedRadius;
+
+            float outwardVelocity =
+                dot(velocity.xz, wallNormal);
+
+            if (outwardVelocity > 0)
+            {
+                velocity.xz -=
+                    outwardVelocity *
+                    wallNormal;
+            }
+
+            velocity.xz *= _WallFriction;
+        }
+
+        float minimumFillHeight =
+            _ParticleRadius * 2.0;
+
+        float visibleFillHeight =
+            max(minimumFillHeight, _CurrentFillHeight);
+
+        float fillTop =
+            _BottomY +
+            visibleFillHeight -
+            _ParticleRadius;
+
+        if (position.y > fillTop)
+        {
+            position.y = fillTop;
+
+            if (velocity.y > 0)
+                velocity.y = 0;
+        }
+
+        float bottomLimit =
+            _BottomY +
+            _ParticleRadius;
+
+        if (position.y < bottomLimit)
+        {
+            bool holeOpen =
+                _AllowDrain > 0.5 &&
+                _HoleRadius > 0.000001;
+
+            float holeDistance =
+                distance(
+                    position.xz,
+                    _HoleLocal.xz
+                );
+
+            bool insideHole =
+                holeOpen &&
+                holeDistance <= _HoleRadius;
+
+            bool drainPermission = false;
+
+            if (
+                insideHole &&
+                _DrainParticleBudget > 0
+            )
+            {
+                uint drainTicket;
+
+                InterlockedAdd(
+                    _DrainCounter[0],
+                    1,
+                    drainTicket
+                );
+
+                drainPermission =
+                    drainTicket <
+                    (uint)_DrainParticleBudget;
+            }
+
+            if (drainPermission)
+            {
+                state = 2.0;
+
+                float3 worldPosition =
+                    mul(
+                        _BucketLocalToWorld,
+                        float4(position, 1)
+                    ).xyz;
+
+                float3 inheritedWorldVelocity =
+                    mul(
+                        _BucketLocalToWorld,
+                        float4(velocity, 0)
+                    ).xyz;
+
+                float3 worldVelocity =
+                    _BucketVelocity +
+                    _ExitDirectionWorld *
+                    max(0.05, _ExitSpeed) +
+                    inheritedWorldVelocity * 0.22;
+
+                worldPosition +=
+                    _ExitDirectionWorld *
+                    _ParticleRadius *
+                    1.6;
+
+                position = worldPosition;
+                velocity = worldVelocity;
+
+                particle.velocityRadius.w =
+                    _ParticleRadius *
+                    _StreamRenderRadiusScale;
+            }
+            else
+            {
+                position.y = bottomLimit;
+
+                if (velocity.y < 0)
+                    velocity.y = 0;
+
+                velocity.xz *= _WallFriction;
+            }
+        }
+    }
+    else if (state < 2.5)
+    {
+        float3 previousPosition = position;
+
+        velocity += _Gravity * dt;
+
+        float airDamping =
+            lerp(
+                0.998,
+                0.992,
+                saturate(_Viscosity01)
+            );
+
+        velocity *= airDamping;
+        position += velocity * dt;
+
+        if (_HasCanvas > 0.5)
+        {
+            float3 baseCanvasNormal =
+                normalize(_CanvasNormalWorld);
+
+            float previousSignedDistance =
+                dot(
+                    previousPosition -
+                    _CanvasPositionWorld,
+                    baseCanvasNormal
+                );
+
+            float currentSignedDistance =
+                dot(
+                    position -
+                    _CanvasPositionWorld,
+                    baseCanvasNormal
+                );
+
+            float distanceDelta =
+                previousSignedDistance -
+                currentSignedDistance;
+
+            bool crossedCanvas =
+                previousSignedDistance *
+                currentSignedDistance <= 0.0 &&
+                abs(distanceDelta) > 0.000001;
+
+            if (crossedCanvas)
+            {
+                float hitTime =
+                    saturate(
+                        previousSignedDistance /
+                        distanceDelta
+                    );
+
+                float3 hitWorldPosition =
+                    lerp(
+                        previousPosition,
+                        position,
+                        hitTime
+                    );
+
+                float3 hitLocalPosition =
+                    mul(
+                        _CanvasWorldToLocal,
+                        float4(hitWorldPosition, 1)
+                    ).xyz;
+
+                bool insideCanvasBounds =
+                    abs(hitLocalPosition.x) <= _CanvasHalfSize.x &&
+                    abs(hitLocalPosition.z) <= _CanvasHalfSize.y;
+
+                if (insideCanvasBounds)
+                {
+                    float sideSign =
+                        previousSignedDistance >= 0.0
+                            ? 1.0
+                            : -1.0;
+
+                    float3 impactNormal =
+                        baseCanvasNormal *
+                        sideSign;
+
+                    float speed =
+                        length(velocity);
+
+                    float3 velocityDirection =
+                        speed > 0.0001
+                            ? velocity / speed
+                            : -impactNormal;
+
+                    float normalImpactAmount =
+                        saturate(
+                            -dot(
+                                velocityDirection,
+                                impactNormal
+                            )
+                        );
+
+                    float grazingAmount =
+                        1.0 -
+                        normalImpactAmount;
+
+                    float speedSpread =
+                        saturate(speed * 0.16);
+
+                    float impactRadiusMultiplier =
+                        1.0 +
+                        _CanvasImpactSpread *
+                        (
+                            speedSpread * 0.45 +
+                            grazingAmount * 0.55
+                        );
+
+                    impactRadiusMultiplier =
+                        clamp(
+                            impactRadiusMultiplier,
+                            1.0,
+                            4.5
+                        );
+
+                    particle.velocityRadius.w =
+                        _ParticleRadius *
+                        _DepositedRadiusScale *
+                        impactRadiusMultiplier;
+
+                    float3 tangentWorldVelocity =
+                        velocity -
+                        impactNormal *
+                        dot(velocity, impactNormal);
+
+                    float3 tangentLocalVelocity =
+                        mul(
+                            _CanvasWorldToLocal,
+                            float4(tangentWorldVelocity, 0)
+                        ).xyz;
+
+                    tangentLocalVelocity.y = 0;
+
+                    if (_UseStage04CanvasPainting > 0.5)
+                    {
+                        float2 impactUv;
+
+                        impactUv.x =
+                            hitLocalPosition.x /
+                            max(
+                                0.0001,
+                                _CanvasHalfSize.x * 2.0
+                            ) +
+                            0.5;
+
+                        impactUv.y =
+                            hitLocalPosition.z /
+                            max(
+                                0.0001,
+                                _CanvasHalfSize.y * 2.0
+                            ) +
+                            0.5;
+
+                        uint impactIndex;
+
+                        InterlockedAdd(
+                            _PaintImpactCount[0],
+                            1,
+                            impactIndex
+                        );
+
+                        if (
+                            impactIndex <
+                            (uint)_MaximumPaintImpacts
+                        )
+                        {
+                            PaintImpact impact;
+
+                            float impactRadiusMeters =
+                                _ParticleRadius *
+                                _DepositedRadiusScale *
+                                impactRadiusMultiplier;
+
+                            float impactStrength =
+                                saturate(
+                                    0.25 +
+                                    speed * 0.12 +
+                                    normalImpactAmount * 0.45
+                                );
+
+                            impact.uvRadius =
+                                float4(
+                                    saturate(impactUv),
+                                    impactRadiusMeters,
+                                    impactStrength
+                                );
+
+                            impact.colorAmount =
+                                float4(
+                                    particle.colorSeed.rgb,
+                                    max(
+                                        0.0000001,
+                                        _VolumePerParticleLiters
+                                    )
+                                );
+
+                            impact.tangentVelocity =
+                                float4(
+                                    tangentLocalVelocity.x,
+                                    tangentLocalVelocity.z,
+                                    normalImpactAmount,
+                                    0
+                                );
+
+                            _PaintImpacts[impactIndex] =
+                                impact;
+                        }
+                    }
+
+                    hitLocalPosition.y =
+                        _CanvasSurfaceOffset *
+                        sideSign;
+
+                    _RestPositions[id] =
+                        float4(
+                            hitLocalPosition,
+                            1
+                        );
+
+                    if (_UseStage04CanvasPainting > 0.5)
+                    {
+                        velocity =
+                            float3(0, 0, 0);
+                    }
+                    else
+                    {
+                        tangentLocalVelocity *=
+                            1.0 -
+                            _CanvasAdhesion;
+
+                        velocity =
+                            tangentLocalVelocity;
+                    }
+
+                    position =
+                        mul(
+                            _CanvasLocalToWorld,
+                            float4(hitLocalPosition, 1)
+                        ).xyz;
+
+                    state = 3.0;
+                }
+            }
+        }
+
+        if (
+            state < 2.5 &&
+            position.y < -30.0
+        )
+        {
+            state = 0.0;
+            position = float3(0, -9999, 0);
+            velocity = float3(0, 0, 0);
+        }
+    }
+    else
+    {
+        if (_UseStage04CanvasPainting > 0.5)
+        {
+            velocity =
+                float3(0, 0, 0);
+        }
+        else if (_HasCanvas < 0.5)
+        {
+            state = 2.0;
+
+            particle.velocityRadius.w =
+                _ParticleRadius *
+                _StreamRenderRadiusScale;
+        }
+        else
+        {
+            float3 localPosition =
+                _RestPositions[id].xyz;
+
+            float3 localGravity =
+                mul(
+                    _CanvasWorldToLocal,
+                    float4(_Gravity, 0)
+                ).xyz;
+
+            localGravity.y = 0;
+
+            float mobility =
+                _CanvasFlowMobility *
+                (1.0 - _CanvasAdhesion) *
+                lerp(
+                    1.0,
+                    0.12,
+                    saturate(_Viscosity01)
+                );
+
+            velocity +=
+                localGravity *
+                mobility *
+                dt;
+
+            float frameCorrectedDamping =
+                pow(
+                    saturate(_CanvasTangentialDamping),
+                    dt * 60.0
+                );
+
+            velocity *= frameCorrectedDamping;
+            velocity.y = 0;
+
+            localPosition.xz += velocity.xz * dt;
+            localPosition.y = _CanvasSurfaceOffset;
+
+            bool outsideCanvas =
+                abs(localPosition.x) > _CanvasHalfSize.x ||
+                abs(localPosition.z) > _CanvasHalfSize.y;
+
+            if (outsideCanvas)
+            {
+                position =
+                    mul(
+                        _CanvasLocalToWorld,
+                        float4(localPosition, 1)
+                    ).xyz;
+
+                float3 worldVelocity =
+                    mul(
+                        _CanvasLocalToWorld,
+                        float4(velocity, 0)
+                    ).xyz;
+
+                worldVelocity -=
+                    normalize(_CanvasNormalWorld) *
+                    _EdgeReleaseSpeed;
+
+                velocity = worldVelocity;
+
+                particle.velocityRadius.w =
+                    _ParticleRadius *
+                    _StreamRenderRadiusScale;
+
+                state = 2.0;
+            }
+            else
+            {
+                _RestPositions[id] =
+                    float4(localPosition, 1);
+
+                position =
+                    mul(
+                        _CanvasLocalToWorld,
+                        float4(localPosition, 1)
+                    ).xyz;
+            }
+        }
+    }
+
+    particle.positionState.xyz = position;
+    particle.positionState.w = state;
+    particle.velocityRadius.xyz = velocity;
+    _Particles[id] = particle;
+}
+
+[numthreads(1, 1, 1)]
+void KernelClearStats(uint id : SV_DispatchThreadID)
+{
+    _Stats[0] = 0;
+    _Stats[1] = 0;
+    _Stats[2] = 0;
+    _Stats[3] = 0;
+}
+
+[numthreads(256, 1, 1)]
+void KernelCountStats(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_ParticleCount)
+        return;
+
+    PaintParticle particle = _Particles[id];
+    float state = particle.positionState.w;
+    uint oldValue;
+
+    if (state < 0.5)
+    {
+        InterlockedAdd(_Stats[3], 1, oldValue);
+    }
+    else if (state < 1.5)
+    {
+        InterlockedAdd(_Stats[0], 1, oldValue);
+    }
+    else if (state < 2.5)
+    {
+        InterlockedAdd(_Stats[1], 1, oldValue);
+    }
+    else
+    {
+        InterlockedAdd(_Stats[2], 1, oldValue);
+    }
+}
+
+[numthreads(256, 1, 1)]
+void KernelApplyRuntimeColor(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_ParticleCount)
+        return;
+
+    PaintParticle particle = _Particles[id];
+    float state = particle.positionState.w;
+
+    if (state < 0.5)
+        return;
+
+    if (
+        _ColorApplyMode == 0 &&
+        state >= 1.5
+    )
+    {
+        return;
+    }
+
+    particle.colorSeed.rgb =
+        _CurrentPaintColor.rgb;
+
+    _Particles[id] = particle;
+}

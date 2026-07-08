@@ -1,0 +1,634 @@
+#pragma kernel KernelClearCanvas
+#pragma kernel KernelClearAccum
+#pragma kernel KernelDepositImpacts
+#pragma kernel KernelResolveDeposits
+#pragma kernel KernelSimulateSurface
+
+struct PaintImpact
+{
+    // xy = UV on canvas
+    // z  = radius in meters
+    // w  = impact strength
+    float4 uvRadius;
+
+    // rgb = particle color
+    // w   = represented paint volume in liters
+    float4 colorAmount;
+
+    // xy = tangent velocity in canvas local X/Z
+    // z  = normal impact amount
+    // w  = reserved
+    float4 tangentVelocity;
+};
+
+StructuredBuffer<PaintImpact> _PaintImpacts;
+StructuredBuffer<uint> _PaintImpactCount;
+
+Texture2D<float4> _ColorRead;
+Texture2D<float> _ThicknessRead;
+Texture2D<float> _WetnessRead;
+Texture2D<float2> _VelocityRead;
+
+RWTexture2D<float4> _ColorWrite;
+RWTexture2D<float> _ThicknessWrite;
+RWTexture2D<float> _WetnessWrite;
+RWTexture2D<float2> _VelocityWrite;
+
+RWTexture2D<uint> _AccumR;
+RWTexture2D<uint> _AccumG;
+RWTexture2D<uint> _AccumB;
+RWTexture2D<uint> _AccumWeight;
+RWTexture2D<uint> _AccumThickness;
+RWTexture2D<uint> _AccumWetness;
+RWTexture2D<int> _AccumVelocityX;
+RWTexture2D<int> _AccumVelocityY;
+
+SamplerState sampler_linear_clamp;
+
+int _TextureResolution;
+int _MaximumImpacts;
+
+float _DeltaTime;
+float4 _CanvasSizeMeters;
+
+float _DepositionThicknessScale;
+float _DepositionRadiusScale;
+float _DepositedWetness;
+float _VelocityStretch;
+
+float _SurfaceAbsorption;
+float _SurfaceMobility;
+float _SurfaceDiffusion;
+float _SurfaceEvaporation;
+float _SurfaceAdhesion;
+
+float4 _SurfaceGravityUV;
+float4 _WoodGrainDirection;
+float _WoodGrainAnisotropy;
+
+static const float COLOR_FIXED = 65535.0;
+static const float THICKNESS_FIXED = 1048576.0;
+static const float WETNESS_FIXED = 65535.0;
+static const float VELOCITY_FIXED = 65536.0;
+
+bool ValidPixel(int2 p)
+{
+    return
+        p.x >= 0 &&
+        p.y >= 0 &&
+        p.x < _TextureResolution &&
+        p.y < _TextureResolution;
+}
+
+float3 SafeColor(float3 c)
+{
+    return max(c, float3(0.0001, 0.0001, 0.0001));
+}
+
+float3 SubtractiveMix(
+    float3 oldColor,
+    float oldWeight,
+    float3 newColor,
+    float newWeight
+)
+{
+    float total = oldWeight + newWeight;
+
+    if (total <= 0.000001)
+        return newColor;
+
+    float3 oldAbsorption = -log(SafeColor(oldColor));
+    float3 newAbsorption = -log(SafeColor(newColor));
+
+    float3 mixedAbsorption =
+        (
+            oldAbsorption * oldWeight +
+            newAbsorption * newWeight
+        ) /
+        total;
+
+    return saturate(exp(-mixedAbsorption));
+}
+
+float4 SampleColor(float2 uv)
+{
+    return _ColorRead.SampleLevel(
+        sampler_linear_clamp,
+        saturate(uv),
+        0
+    );
+}
+
+float SampleThickness(float2 uv)
+{
+    return _ThicknessRead.SampleLevel(
+        sampler_linear_clamp,
+        saturate(uv),
+        0
+    );
+}
+
+float SampleWetness(float2 uv)
+{
+    return _WetnessRead.SampleLevel(
+        sampler_linear_clamp,
+        saturate(uv),
+        0
+    );
+}
+
+float2 SampleVelocity(float2 uv)
+{
+    return _VelocityRead.SampleLevel(
+        sampler_linear_clamp,
+        saturate(uv),
+        0
+    );
+}
+
+[numthreads(8, 8, 1)]
+void KernelClearCanvas(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureResolution || id.y >= _TextureResolution)
+        return;
+
+    int2 p = int2(id.xy);
+
+    _ColorWrite[p] = float4(0, 0, 0, 0);
+    _ThicknessWrite[p] = 0;
+    _WetnessWrite[p] = 0;
+    _VelocityWrite[p] = float2(0, 0);
+}
+
+[numthreads(8, 8, 1)]
+void KernelClearAccum(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureResolution || id.y >= _TextureResolution)
+        return;
+
+    int2 p = int2(id.xy);
+
+    _AccumR[p] = 0;
+    _AccumG[p] = 0;
+    _AccumB[p] = 0;
+    _AccumWeight[p] = 0;
+    _AccumThickness[p] = 0;
+    _AccumWetness[p] = 0;
+    _AccumVelocityX[p] = 0;
+    _AccumVelocityY[p] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void KernelDepositImpacts(uint id : SV_DispatchThreadID)
+{
+    uint impactCount = min(
+        _PaintImpactCount[0],
+        (uint)_MaximumImpacts
+    );
+
+    if (id >= impactCount)
+        return;
+
+    PaintImpact impact = _PaintImpacts[id];
+
+    float2 uv = saturate(impact.uvRadius.xy);
+
+    float radiusMeters =
+        max(0.00025, impact.uvRadius.z * _DepositionRadiusScale);
+
+    float impactStrength =
+        max(0.05, impact.uvRadius.w);
+
+    float2 tangentVelocity =
+        impact.tangentVelocity.xy;
+
+    float tangentSpeed =
+        length(tangentVelocity);
+
+    float2 direction =
+        tangentSpeed > 0.0001
+            ? tangentVelocity / tangentSpeed
+            : float2(1, 0);
+
+    float2 perpendicular =
+        float2(-direction.y, direction.x);
+
+    float stretch =
+        1.0 +
+        tangentSpeed *
+        _VelocityStretch;
+
+    stretch = clamp(stretch, 1.0, 4.0);
+
+    float radiusPixelsX =
+        radiusMeters /
+        max(0.001, _CanvasSizeMeters.x) *
+        _TextureResolution;
+
+    float radiusPixelsY =
+        radiusMeters /
+        max(0.001, _CanvasSizeMeters.y) *
+        _TextureResolution;
+
+    int2 centerPixel =
+        int2(
+            uv *
+            _TextureResolution
+        );
+
+    int extentX =
+        (int)ceil(radiusPixelsX * stretch) + 1;
+
+    int extentY =
+        (int)ceil(radiusPixelsY * stretch) + 1;
+
+    float amountLiters =
+        max(0.0000001, impact.colorAmount.w);
+
+    float amountScale =
+        amountLiters *
+        _DepositionThicknessScale *
+        1000.0;
+
+    for (int y = -extentY; y <= extentY; y++)
+    {
+        for (int x = -extentX; x <= extentX; x++)
+        {
+            int2 pixel =
+                centerPixel + int2(x, y);
+
+            if (!ValidPixel(pixel))
+                continue;
+
+            float2 pixelUv =
+                (float2(pixel) + 0.5) /
+                _TextureResolution;
+
+            float2 deltaMeters =
+                float2(
+                    (pixelUv.x - uv.x) *
+                    _CanvasSizeMeters.x,
+
+                    (pixelUv.y - uv.y) *
+                    _CanvasSizeMeters.y
+                );
+
+            float along =
+                dot(deltaMeters, direction) /
+                (radiusMeters * stretch);
+
+            float across =
+                dot(deltaMeters, perpendicular) /
+                radiusMeters;
+
+            float normalizedDistance =
+                sqrt(along * along + across * across);
+
+            if (normalizedDistance >= 1.0)
+                continue;
+
+            float weight =
+                saturate(1.0 - normalizedDistance);
+
+            weight =
+                weight * weight *
+                (3.0 - 2.0 * weight);
+
+            weight *= impactStrength;
+
+            uint fixedWeight =
+                (uint)max(
+                    1.0,
+                    weight * COLOR_FIXED
+                );
+
+            uint fixedR =
+                (uint)max(
+                    0.0,
+                    saturate(impact.colorAmount.r) *
+                    fixedWeight
+                );
+
+            uint fixedG =
+                (uint)max(
+                    0.0,
+                    saturate(impact.colorAmount.g) *
+                    fixedWeight
+                );
+
+            uint fixedB =
+                (uint)max(
+                    0.0,
+                    saturate(impact.colorAmount.b) *
+                    fixedWeight
+                );
+
+            uint fixedThickness =
+                (uint)max(
+                    1.0,
+                    weight *
+                    amountScale *
+                    THICKNESS_FIXED
+                );
+
+            uint fixedWetness =
+                (uint)max(
+                    1.0,
+                    weight *
+                    _DepositedWetness *
+                    WETNESS_FIXED
+                );
+
+            int fixedVelocityX =
+                (int)(
+                    tangentVelocity.x *
+                    weight *
+                    VELOCITY_FIXED
+                );
+
+            int fixedVelocityY =
+                (int)(
+                    tangentVelocity.y *
+                    weight *
+                    VELOCITY_FIXED
+                );
+
+            uint oldU;
+            int oldI;
+
+            InterlockedAdd(_AccumR[pixel], fixedR, oldU);
+            InterlockedAdd(_AccumG[pixel], fixedG, oldU);
+            InterlockedAdd(_AccumB[pixel], fixedB, oldU);
+            InterlockedAdd(_AccumWeight[pixel], fixedWeight, oldU);
+            InterlockedAdd(_AccumThickness[pixel], fixedThickness, oldU);
+            InterlockedAdd(_AccumWetness[pixel], fixedWetness, oldU);
+            InterlockedAdd(_AccumVelocityX[pixel], fixedVelocityX, oldI);
+            InterlockedAdd(_AccumVelocityY[pixel], fixedVelocityY, oldI);
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void KernelResolveDeposits(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureResolution || id.y >= _TextureResolution)
+        return;
+
+    int2 p = int2(id.xy);
+
+    float4 oldColorValue = _ColorRead.Load(int3(p, 0));
+    float oldThickness = _ThicknessRead.Load(int3(p, 0));
+    float oldWetness = _WetnessRead.Load(int3(p, 0));
+    float2 oldVelocity = _VelocityRead.Load(int3(p, 0));
+
+    uint weightFixed = _AccumWeight[p];
+
+    if (weightFixed == 0)
+    {
+        _ColorWrite[p] = oldColorValue;
+        _ThicknessWrite[p] = oldThickness;
+        _WetnessWrite[p] = oldWetness;
+        _VelocityWrite[p] = oldVelocity;
+        return;
+    }
+
+    float incomingWeight =
+        weightFixed / COLOR_FIXED;
+
+    float3 incomingColor =
+        float3(
+            _AccumR[p],
+            _AccumG[p],
+            _AccumB[p]
+        ) /
+        max(1.0, (float)weightFixed);
+
+    float incomingThickness =
+        _AccumThickness[p] /
+        THICKNESS_FIXED;
+
+    float incomingWetness =
+        _AccumWetness[p] /
+        WETNESS_FIXED;
+
+    float2 incomingVelocity =
+        float2(
+            _AccumVelocityX[p],
+            _AccumVelocityY[p]
+        ) /
+        VELOCITY_FIXED /
+        max(0.0001, incomingWeight);
+
+    float3 mixedColor =
+        oldThickness > 0.000001
+            ? SubtractiveMix(
+                oldColorValue.rgb,
+                oldThickness,
+                incomingColor,
+                incomingThickness
+            )
+            : incomingColor;
+
+    float newThickness =
+        oldThickness +
+        incomingThickness;
+
+    float newWetness =
+        saturate(
+            max(oldWetness, incomingWetness)
+        );
+
+    float2 newVelocity =
+        (
+            oldVelocity *
+            oldThickness +
+            incomingVelocity *
+            incomingThickness
+        ) /
+        max(0.000001, newThickness);
+
+    _ColorWrite[p] =
+        float4(
+            mixedColor,
+            saturate(newThickness)
+        );
+
+    _ThicknessWrite[p] =
+        newThickness;
+
+    _WetnessWrite[p] =
+        newWetness;
+
+    _VelocityWrite[p] =
+        newVelocity;
+}
+
+[numthreads(8, 8, 1)]
+void KernelSimulateSurface(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureResolution || id.y >= _TextureResolution)
+        return;
+
+    int2 p = int2(id.xy);
+
+    float2 uv =
+        (float2(p) + 0.5) /
+        _TextureResolution;
+
+    float thickness =
+        _ThicknessRead.Load(int3(p, 0));
+
+    if (thickness <= 0.0000001)
+    {
+        _ColorWrite[p] = float4(0, 0, 0, 0);
+        _ThicknessWrite[p] = 0;
+        _WetnessWrite[p] = 0;
+        _VelocityWrite[p] = float2(0, 0);
+        return;
+    }
+
+    float wetness =
+        _WetnessRead.Load(int3(p, 0));
+
+    float2 velocity =
+        _VelocityRead.Load(int3(p, 0));
+
+    float mobileWetness =
+        saturate(wetness) *
+        (1.0 - _SurfaceAdhesion);
+
+    velocity +=
+        _SurfaceGravityUV.xy *
+        _SurfaceMobility *
+        mobileWetness *
+        _DeltaTime;
+
+    float2 grain =
+        normalize(
+            _WoodGrainDirection.xy +
+            float2(0.0001, 0)
+        );
+
+    float grainVelocity =
+        dot(velocity, grain);
+
+    float2 acrossGrain =
+        velocity -
+        grain * grainVelocity;
+
+    velocity =
+        grain * grainVelocity +
+        acrossGrain *
+        (1.0 - _WoodGrainAnisotropy);
+
+    float damping =
+        exp(
+            -(
+                2.0 +
+                _SurfaceAdhesion * 10.0 +
+                _SurfaceAbsorption * 4.0
+            ) *
+            _DeltaTime
+        );
+
+    velocity *= damping;
+
+    float2 backUv =
+        uv -
+        velocity *
+        _DeltaTime;
+
+    float4 advectedColor =
+        SampleColor(backUv);
+
+    float advectedThickness =
+        SampleThickness(backUv);
+
+    float advectedWetness =
+        SampleWetness(backUv);
+
+    float2 advectedVelocity =
+        SampleVelocity(backUv);
+
+    float2 texel =
+        1.0 /
+        _TextureResolution;
+
+    float4 neighborColor =
+        (
+            SampleColor(uv + float2(texel.x, 0)) +
+            SampleColor(uv - float2(texel.x, 0)) +
+            SampleColor(uv + float2(0, texel.y)) +
+            SampleColor(uv - float2(0, texel.y))
+        ) * 0.25;
+
+    float neighborThickness =
+        (
+            SampleThickness(uv + float2(texel.x, 0)) +
+            SampleThickness(uv - float2(texel.x, 0)) +
+            SampleThickness(uv + float2(0, texel.y)) +
+            SampleThickness(uv - float2(0, texel.y))
+        ) * 0.25;
+
+    float diffusionAmount =
+        saturate(
+            _SurfaceDiffusion *
+            advectedWetness *
+            _DeltaTime *
+            12.0
+        );
+
+    float4 finalColor =
+        lerp(
+            advectedColor,
+            neighborColor,
+            diffusionAmount
+        );
+
+    float finalThickness =
+        lerp(
+            advectedThickness,
+            neighborThickness,
+            diffusionAmount * 0.55
+        );
+
+    float finalWetness =
+        max(
+            0.0,
+            advectedWetness -
+            (
+                _SurfaceEvaporation +
+                _SurfaceAbsorption * 0.04
+            ) *
+            _DeltaTime
+        );
+
+    float absorbedFraction =
+        saturate(
+            _SurfaceAbsorption *
+            _DeltaTime *
+            0.25
+        );
+
+    finalThickness =
+        lerp(
+            finalThickness,
+            max(finalThickness, thickness),
+            absorbedFraction
+        );
+
+    _ColorWrite[p] =
+        float4(
+            finalColor.rgb,
+            saturate(finalThickness)
+        );
+
+    _ThicknessWrite[p] =
+        max(0.0, finalThickness);
+
+    _WetnessWrite[p] =
+        saturate(finalWetness);
+
+    _VelocityWrite[p] =
+        advectedVelocity * damping;
+}
