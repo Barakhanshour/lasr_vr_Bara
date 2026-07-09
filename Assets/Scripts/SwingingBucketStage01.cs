@@ -8,6 +8,37 @@ using UnityEngine.InputSystem;
 [DisallowMultipleComponent]
 public class SwingingBucketStage01 : MonoBehaviour
 {
+    public void Stage01_SetStartAngleAndPreview(
+    float angleDegrees
+)
+    {
+        startAngleDegrees = Mathf.Clamp(
+            angleDegrees,
+            0.0f,
+            85.0f
+        );
+
+        /*
+         * عند استخدام Start Angle يجب ألا نبدأ
+         * من موضع الدلو الحالي، لأن ذلك يلغي تأثير الزاوية.
+         */
+        startFromCurrentHandlePosition = false;
+
+        /*
+         * لا نغيّر وضع البداية أثناء حركة التجربة.
+         * يتم التطبيق المباشر فقط عندما تكون المحاكاة متوقفة.
+         */
+        if (
+            Application.isPlaying &&
+            !simulationRunning &&
+            !isGrabbed
+        )
+        {
+            Stage01_ResetSimulation();
+            Stage01_SetSimulationRunning(false);
+        }
+    }
+
     [Header("STAGE 01 - References")]
     public Transform fixedAnchorPoint;
     public Transform bucketRoot;
@@ -23,6 +54,34 @@ public class SwingingBucketStage01 : MonoBehaviour
     [Tooltip("How chunky the rope is per meter. e.g., 0.06 means 60g/m.")]
     [Min(0.0f)]
     public float ropeMassPerMeterKg = 0.06f;
+
+    /// <summary>
+    /// ///////////محمد
+    /// </summary>
+    [SerializeField]
+    private bool simulationRunning;
+
+    public bool IsSimulationRunning =>
+        simulationRunning;
+
+    public void Stage01_SetSimulationRunning(
+        bool running
+    )
+    {
+        simulationRunning = running;
+
+        // عند الإيقاف نمسح الزمن الجزئي المتراكم،
+        // حتى لا تحدث قفزة عند المتابعة.
+        if (!running)
+        {
+            accumulator = 0.0f;
+            BucketVelocity = Vector3.zero;
+            isGrabbed = false;
+        }
+    }
+    /// <summary>
+    /// ///////////محمد
+    /// </summary>
 
     public float BucketAndPaintMassKg
     {
@@ -154,6 +213,7 @@ public class SwingingBucketStage01 : MonoBehaviour
     private bool initialized;
 
     private GameObject ropeVisualObject;
+
     private Mesh ropeMesh;
 
     private bool isGrabbed;
@@ -173,9 +233,11 @@ public class SwingingBucketStage01 : MonoBehaviour
         if (Application.isPlaying)
         {
             Stage01_ResetSimulation();
+
+            // لا تبدأ الحركة حتى يضغط المستخدم Start.
+            simulationRunning = false;
         }
     }
-
     private void Update()
     {
         if (Application.isPlaying)
@@ -189,17 +251,39 @@ public class SwingingBucketStage01 : MonoBehaviour
                 return;
             }
 
-            Stage01_HandleManualGrabInput(Time.deltaTime);
+            // لا نسمح بالإمساك إلا أثناء تشغيل التجربة.
+            if (simulationRunning)
+            {
+                Stage01_HandleManualGrabInput(
+                    Time.deltaTime
+                );
+            }
 
             if (isGrabbed)
             {
-                Stage01_UpdateGrabbedMotion(Time.deltaTime);
+                Stage01_UpdateGrabbedMotion(
+                    Time.deltaTime
+                );
+
                 Stage01_ApplyBucketTransform();
-                Stage01_UpdateRopeVisual(handlePosition);
+
+                Stage01_UpdateRopeVisual(
+                    handlePosition
+                );
+            }
+            else if (simulationRunning)
+            {
+                Stage01_Tick(
+                    Time.deltaTime
+                );
             }
             else
             {
-                Stage01_Tick(Time.deltaTime);
+                Stage01_ApplyBucketTransform();
+
+                Stage01_UpdateRopeVisual(
+                    handlePosition
+                );
             }
         }
         else

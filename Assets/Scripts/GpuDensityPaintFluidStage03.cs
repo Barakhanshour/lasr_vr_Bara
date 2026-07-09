@@ -130,6 +130,33 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
     private const float FLOAT_CHANGE_THRESHOLD = 0.0001f;
     private const float MAX_BUCKET_ACCELERATION = 25.0f;
 
+
+    public int ActiveParticleCount => activeParticleCount;
+
+    public float CalculatedPaintVolumeLiters =>
+        calculatedPaintVolumeLiters;
+
+    public float CurrentFlowLitersPerSecond =>
+        currentFlowLitersPerSecond;
+    public int InsideBucketParticleCount =>
+    insideBucketParticleCount;
+
+    public int AirborneParticleCount =>
+        airborneParticleCount;
+
+    public int DepositedParticleCount =>
+        depositedParticleCount;
+
+    public int InactiveParticleCount =>
+        inactiveParticleCount;
+
+    public float VolumePerParticleLiters =>
+        volumePerParticleLiters;
+
+    public int CurrentDrainParticleBudget =>
+        currentDrainParticleBudget;
+
+
     private struct GpuPaintParticle
     {
         public Vector4 positionState;
@@ -182,7 +209,10 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
 
     private void Start()
     {
-        InitializeFluid();
+        if (simulateFluid)
+        {
+            InitializeFluid();
+        }
     }
 
     private void LateUpdate()
