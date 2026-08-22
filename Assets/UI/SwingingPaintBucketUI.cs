@@ -2596,7 +2596,7 @@ StopExperiment
 
         if (fluidStage != null)
         {
-            if (liveTexts.ContainsKey("particles")) liveTexts["particles"].text = fluidStage.ActiveParticleCount.ToString();
+         //   if (liveTexts.ContainsKey("particles")) liveTexts["particles"].text = fluidStage.ActiveParticleCount.ToString();
             if (liveTexts.ContainsKey("paintVol")) liveTexts["paintVol"].text = fluidStage.CalculatedPaintVolumeLiters.ToString("F3");
             if (liveTexts.ContainsKey("flow")) liveTexts["flow"].text = fluidStage.CurrentFlowLitersPerSecond.ToString("F3");
         }
