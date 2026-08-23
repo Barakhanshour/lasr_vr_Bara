@@ -28,6 +28,10 @@ Material:
         m_Texture: {fileID: 2800000, guid: 7af2bc290a79f63479292b5ecdab8284, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _PaintAgeMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _PaintColorMap:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
@@ -42,11 +46,23 @@ Material:
         m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats:
-    - _DryPaintSmoothness: 0.25
-    - _ReliefStrength: 1.25
+    - _DebugDrying: 0
+    - _DebugMapping: 0
+    - _DryPaintSmoothness: 0.3
+    - _DryingDelaySeconds: 60
+    - _MaxDryColorShiftFraction: 0.08
+    - _PaintHidingCoefficient: 60
+    - _PigmentOpticalExtinctionPerMeter: 45000
+    - _ReliefStrength: 0.25
     - _ThicknessVisibility: 5
-    - _WetPaintSmoothness: 0.92
+    - _WetPaintSmoothness: 0.95
     m_Colors:
     - _BaseColor: {r: 1, g: 1, b: 1, a: 1}
+    - _PaintLocalAxisU: {r: 1, g: 0, b: 0, a: 0}
+    - _PaintLocalAxisV: {r: 0, g: 1, b: 0, a: 0}
+    - _PaintLocalCenter: {r: 0, g: 0, b: 0, a: 1}
+    - _PaintLocalHalfSize: {r: 0.5, g: 0.5, b: 0, a: 0}
+    - _PaintMetersPerTexel: {r: 0.00390625, g: 0.0029296875, b: 0, a: 0}
+    - _PaintTexelSize: {r: 0.0009765625, g: 0.0009765625, b: 1024, a: 1024}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

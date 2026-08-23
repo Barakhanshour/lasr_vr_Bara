@@ -4,21 +4,20 @@
 #pragma kernel KernelResolveDeposits
 #pragma kernel KernelSimulateSurface
 
+// FINAL SURFACE CORE 2026
+// Built from the proven Phase 3E conservative puddle/tilt solver.
+// Adds Safe-UAV binding, physical viscosity from Stage02, and stable paint retention.
+// - DX11/Unity-safe HLSL only (no conditional operator on custom structs).
+// - Conservative transport of thickness, pigment amount, wetness amount and age amount.
+// - Empty destination cells are allowed to receive paint, so a stationary stream can form a puddle.
+// - Physical film thickness is stored in meters.
+// - Drying is disabled until the configured delay expires.
+
 struct PaintImpact
 {
-    // xy = UV on canvas
-    // z  = radius in meters
-    // w  = impact strength
-    float4 uvRadius;
-
-    // rgb = particle color
-    // w   = represented paint volume in liters
-    float4 colorAmount;
-
-    // xy = tangent velocity in canvas local X/Z
-    // z  = normal impact amount
-    // w  = reserved
-    float4 tangentVelocity;
+    float4 uvRadius; // xy: UV, z: radius in meters, w: impact strength
+    float4 colorAmount; // rgb: paint color, w: represented paint volume in liters
+    float4 tangentVelocity; // xy: canvas tangent velocity in m/s
 };
 
 StructuredBuffer<PaintImpact> _PaintImpacts;
@@ -27,123 +26,352 @@ StructuredBuffer<uint> _PaintImpactCount;
 Texture2D<float4> _ColorRead;
 Texture2D<float> _ThicknessRead;
 Texture2D<float> _WetnessRead;
+Texture2D<float> _AgeRead;
 Texture2D<float2> _VelocityRead;
 
 RWTexture2D<float4> _ColorWrite;
 RWTexture2D<float> _ThicknessWrite;
 RWTexture2D<float> _WetnessWrite;
+RWTexture2D<float> _AgeWrite;
 RWTexture2D<float2> _VelocityWrite;
 
-RWTexture2D<uint> _AccumR;
-RWTexture2D<uint> _AccumG;
-RWTexture2D<uint> _AccumB;
-RWTexture2D<uint> _AccumWeight;
-RWTexture2D<uint> _AccumThickness;
-RWTexture2D<uint> _AccumWetness;
-RWTexture2D<int> _AccumVelocityX;
-RWTexture2D<int> _AccumVelocityY;
-
-SamplerState sampler_linear_clamp;
+// Accumulation textures are UAVs only in Clear/Deposit and SRVs in Resolve.
+// This keeps every kernel at or below the DX11 8-UAV limit.
+RWTexture2D<uint> _AccumRWrite;
+Texture2D<uint> _AccumRRead;
+RWTexture2D<uint> _AccumGWrite;
+Texture2D<uint> _AccumGRead;
+RWTexture2D<uint> _AccumBWrite;
+Texture2D<uint> _AccumBRead;
+RWTexture2D<uint> _AccumWeightWrite;
+Texture2D<uint> _AccumWeightRead;
+RWTexture2D<uint> _AccumThicknessWrite;
+Texture2D<uint> _AccumThicknessRead;
+RWTexture2D<uint> _AccumWetnessWrite;
+Texture2D<uint> _AccumWetnessRead;
+RWTexture2D<int> _AccumVelocityXWrite;
+Texture2D<int> _AccumVelocityXRead;
+RWTexture2D<int> _AccumVelocityYWrite;
+Texture2D<int> _AccumVelocityYRead;
 
 int _TextureResolution;
 int _MaximumImpacts;
 
 float _DeltaTime;
 float4 _CanvasSizeMeters;
-
-float _DepositionThicknessScale;
-float _DepositionRadiusScale;
 float _DepositedWetness;
 float _VelocityStretch;
 
 float _SurfaceAbsorption;
 float _SurfaceMobility;
-float _SurfaceDiffusion;
-float _SurfaceEvaporation;
 float _SurfaceAdhesion;
-
-float4 _SurfaceGravityUV;
+float _ResidualFilmThicknessMeters;
+float _DryingDelaySeconds;
+float _WetnessHalfLifeSeconds;
+float4 _SurfaceGravityMS2;
+float _SurfaceNormalGravityMS2;
+float _PaintDensityKgM3;
+float _DynamicViscosityPaS;
 float4 _WoodGrainDirection;
 float _WoodGrainAnisotropy;
 
-static const float COLOR_FIXED = 65535.0;
-static const float THICKNESS_FIXED = 1048576.0;
-static const float WETNESS_FIXED = 65535.0;
-static const float VELOCITY_FIXED = 65536.0;
+// Physical thickness is usually micrometers to millimeters.
+// 2^30 units/m gives sub-nanometer numerical resolution while still leaving
+// several meters of headroom before a uint overflow (far beyond this experiment).
+static const float MASS_FIXED = 1073741824.0;
+static const float IMPACT_WEIGHT_FIXED = 1024.0;
+static const float IMPACT_VELOCITY_FIXED = 128.0;
+static const float LN2 = 0.6931471805599453;
+static const float PI_VALUE = 3.14159265358979323846;
+static const float MIN_DEPOSITION_RADIUS_PIXELS = 1.75;
+static const float MIN_FILM_THICKNESS_METERS = 1e-9;
 
 bool ValidPixel(int2 p)
 {
-    return
-        p.x >= 0 &&
-        p.y >= 0 &&
-        p.x < _TextureResolution &&
-        p.y < _TextureResolution;
+    return p.x >= 0 && p.y >= 0 && p.x < _TextureResolution && p.y < _TextureResolution;
 }
 
-float3 SafeColor(float3 c)
+float3 SafePigmentColor(float3 c)
 {
-    return max(c, float3(0.0001, 0.0001, 0.0001));
+    // Digital primary colors often contain exact zero channels. Real pigments still
+    // reflect a small amount of light, so use a small physical floor before taking log.
+    return max(saturate(c), float3(0.025, 0.025, 0.025));
 }
 
-float3 SubtractiveMix(
-    float3 oldColor,
-    float oldWeight,
-    float3 newColor,
-    float newWeight
+float3 MixPigmentsSubtractive(float3 oldColor, float oldThickness, float3 newColor, float newThickness)
+{
+    float total = oldThickness + newThickness;
+    if (total <= MIN_FILM_THICKNESS_METERS)
+        return saturate(newColor);
+
+    float3 oldAbsorbance = -log(SafePigmentColor(oldColor));
+    float3 newAbsorbance = -log(SafePigmentColor(newColor));
+    float3 mixedAbsorbance =
+        (oldAbsorbance * oldThickness + newAbsorbance * newThickness) / total;
+
+    return saturate(exp(-mixedAbsorbance));
+}
+
+void ReadState(
+    int2 p,
+    out float h,
+    out float3 pigmentAmount,
+    out float wetnessAmount,
+    out float ageAmount,
+    out float2 velocity
 )
 {
-    float total = oldWeight + newWeight;
+    if (!ValidPixel(p))
+    {
+        h = 0.0;
+        pigmentAmount = float3(0.0, 0.0, 0.0);
+        wetnessAmount = 0.0;
+        ageAmount = 0.0;
+        velocity = float2(0.0, 0.0);
+        return;
+    }
 
-    if (total <= 0.000001)
-        return newColor;
+    h = max(0.0, _ThicknessRead.Load(int3(p, 0)));
 
-    float3 oldAbsorption = -log(SafeColor(oldColor));
-    float3 newAbsorption = -log(SafeColor(newColor));
+    float3 color = saturate(_ColorRead.Load(int3(p, 0)).rgb);
+    float wetness = saturate(_WetnessRead.Load(int3(p, 0)));
+    float ageSeconds = max(0.0, _AgeRead.Load(int3(p, 0)));
 
-    float3 mixedAbsorption =
-        (
-            oldAbsorption * oldWeight +
-            newAbsorption * newWeight
-        ) /
-        total;
+    // Explicit rule requested for the experiment: no drying before the delay.
+    if (h > MIN_FILM_THICKNESS_METERS && ageSeconds < _DryingDelaySeconds)
+        wetness = 1.0;
 
-    return saturate(exp(-mixedAbsorption));
+    pigmentAmount = color * h;
+    wetnessAmount = wetness * h;
+    ageAmount = ageSeconds * h;
+    velocity = _VelocityRead.Load(int3(p, 0));
 }
 
-float4 SampleColor(float2 uv)
+float StateWetness(float h, float wetnessAmount)
 {
-    return _ColorRead.SampleLevel(
-        sampler_linear_clamp,
-        saturate(uv),
-        0
-    );
+    if (h <= MIN_FILM_THICKNESS_METERS)
+        return 0.0;
+
+    return saturate(wetnessAmount / max(MIN_FILM_THICKNESS_METERS, h));
 }
 
-float SampleThickness(float2 uv)
+float SurfaceResistancePerSecond(float wetness)
 {
-    return _ThicknessRead.SampleLevel(
-        sampler_linear_clamp,
-        saturate(uv),
-        0
-    );
+    // Surface/material resistance only. Paint viscosity is handled separately
+    // through the lubrication mobility rho*h^2/(3*mu).
+    float mobilityPenalty = (1.0 - saturate(_SurfaceMobility)) * 2.5;
+    float adhesionPenalty = saturate(_SurfaceAdhesion) * 4.0;
+    float absorptionPenalty = saturate(_SurfaceAbsorption) * 1.5;
+    float dryingPenalty = (1.0 - saturate(wetness)) * 8.0;
+
+    return 0.75 + mobilityPenalty + adhesionPenalty + absorptionPenalty + dryingPenalty;
 }
 
-float SampleWetness(float2 uv)
+float ThinFilmMobility(float filmThicknessMeters, float wetness)
 {
-    return _WetnessRead.SampleLevel(
-        sampler_linear_clamp,
-        saturate(uv),
-        0
-    );
+    // Lubrication approximation for a Newtonian film:
+    // mean velocity = [rho * h^2 / (3*mu)] * drivingAcceleration.
+    // The user's single Stage02 viscosity source is converted to mu (Pa.s) in C#.
+    float rho = max(100.0, _PaintDensityKgM3);
+    float mu = max(0.05, _DynamicViscosityPaS);
+    float h = max(0.0, filmThicknessMeters);
+
+    float physicalMobility = rho * h * h / (3.0 * mu);
+
+    // Surface response changes slip/adhesion without inventing another viscosity.
+    float surfaceSlip = lerp(0.30, 1.15, saturate(_SurfaceMobility));
+    float adhesionSlip = lerp(1.0, 0.42, saturate(_SurfaceAdhesion));
+    float wetFactor = lerp(0.70, 1.0, saturate(wetness));
+
+    return physicalMobility * surfaceSlip * adhesionSlip * wetFactor;
 }
 
-float2 SampleVelocity(float2 uv)
+float LevelingActivation(float filmThicknessMeters)
 {
-    return _VelocityRead.SampleLevel(
-        sampler_linear_clamp,
-        saturate(uv),
-        0
-    );
+    // Smooth, continuous transition: thin strokes barely self-level, while a
+    // genuinely thick puddle levels strongly. There is no hard yield cutoff.
+    const float referenceThickness = 0.00055; // 0.75 mm
+    float x = max(0.0, filmThicknessMeters) / referenceThickness;
+    float a = x / (1.0 + x);
+    return a * a;
+}
+
+float AxisGrainFactor(float2 axis)
+{
+    float2 rawGrain = _WoodGrainDirection.xy;
+    float grainLength = length(rawGrain);
+
+    if (grainLength <= 1e-6)
+        return 1.0;
+
+    float2 grain = rawGrain / grainLength;
+    float alignment = abs(dot(grain, axis));
+    return lerp(1.0 - saturate(_WoodGrainAnisotropy), 1.0, alignment);
+}
+
+float ClampFaceVelocityForCFL(float velocity, float cellSizeMeters)
+{
+    float dt = max(1e-6, _DeltaTime);
+
+    // A cell can lose through four faces. 0.22 per face keeps the total
+    // outgoing fraction below one for this explicit finite-volume step.
+    float maxFaceSpeed = 0.22 * cellSizeMeters / dt;
+    return clamp(velocity, -maxFaceSpeed, maxFaceSpeed);
+}
+
+void ComputeFaceFluxX(
+    int2 leftPixel,
+    int2 rightPixel,
+    out float hFlux,
+    out float3 pigmentFlux,
+    out float wetnessFlux,
+    out float ageFlux,
+    out float faceVelocity
+)
+{
+    float hL, wetL, ageL;
+    float3 pigmentL;
+    float2 velocityL;
+    ReadState(leftPixel, hL, pigmentL, wetL, ageL, velocityL);
+
+    float hR, wetR, ageR;
+    float3 pigmentR;
+    float2 velocityR;
+    ReadState(rightPixel, hR, pigmentR, wetR, ageR, velocityR);
+
+    float dx = max(1e-6, _CanvasSizeMeters.x / max(1, _TextureResolution));
+    float wetFace = max(StateWetness(hL, wetL), StateWetness(hR, wetR));
+    float hFace = max(hL, hR);
+
+    float freeSurfaceSlope = (hR - hL) / dx;
+
+    // Two real physical causes are kept separate:
+    // 1) gravity along the tilted board;
+    // 2) hydrostatic leveling caused by a thickness gradient.
+    // Only self-leveling is strongly reduced for very thin strokes.
+    float tiltAcceleration = _SurfaceGravityMS2.x;
+    float levelingAcceleration =
+        -_SurfaceNormalGravityMS2 * freeSurfaceSlope * LevelingActivation(hFace);
+
+    float targetVelocity =
+        (tiltAcceleration * 4.0 + levelingAcceleration) *
+        ThinFilmMobility(hFace, wetFace) *
+        AxisGrainFactor(float2(1.0, 0.0));
+
+    float oldFaceVelocity = 0.5 * (velocityL.x + velocityR.x);
+    float relaxationRate = SurfaceResistancePerSecond(wetFace);
+    float response = 1.0 - exp(-relaxationRate * _DeltaTime);
+
+    faceVelocity = lerp(oldFaceVelocity, targetVelocity, response);
+    faceVelocity = ClampFaceVelocityForCFL(faceVelocity, dx);
+
+    float donorH;
+    float3 donorPigment;
+    float donorWetness;
+    float donorAge;
+
+    if (faceVelocity >= 0.0)
+    {
+        donorH = hL;
+        donorPigment = pigmentL;
+        donorWetness = wetL;
+        donorAge = ageL;
+    }
+    else
+    {
+        donorH = hR;
+        donorPigment = pigmentR;
+        donorWetness = wetR;
+        donorAge = ageR;
+    }
+
+    // A thin adhered residue must remain on the board. Only the film above this
+    // physical residual thickness is allowed to move. This prevents a tilted board
+    // from "washing clean" while still allowing a thick puddle to form a downhill tail.
+    float mobileH = max(0.0, donorH - max(0.0, _ResidualFilmThicknessMeters));
+    float mobileFraction = donorH > MIN_FILM_THICKNESS_METERS
+        ? saturate(mobileH / donorH)
+        : 0.0;
+
+    hFlux = faceVelocity * mobileH;
+    pigmentFlux = faceVelocity * donorPigment * mobileFraction;
+    wetnessFlux = faceVelocity * donorWetness * mobileFraction;
+    ageFlux = faceVelocity * donorAge * mobileFraction;
+}
+
+void ComputeFaceFluxY(
+    int2 bottomPixel,
+    int2 topPixel,
+    out float hFlux,
+    out float3 pigmentFlux,
+    out float wetnessFlux,
+    out float ageFlux,
+    out float faceVelocity
+)
+{
+    float hB, wetB, ageB;
+    float3 pigmentB;
+    float2 velocityB;
+    ReadState(bottomPixel, hB, pigmentB, wetB, ageB, velocityB);
+
+    float hT, wetT, ageT;
+    float3 pigmentT;
+    float2 velocityT;
+    ReadState(topPixel, hT, pigmentT, wetT, ageT, velocityT);
+
+    float dy = max(1e-6, _CanvasSizeMeters.y / max(1, _TextureResolution));
+    float wetFace = max(StateWetness(hB, wetB), StateWetness(hT, wetT));
+    float hFace = max(hB, hT);
+
+    float freeSurfaceSlope = (hT - hB) / dy;
+    float tiltAcceleration = _SurfaceGravityMS2.y;
+    float levelingAcceleration =
+        -_SurfaceNormalGravityMS2 * freeSurfaceSlope * LevelingActivation(hFace);
+
+    float targetVelocity =
+        (tiltAcceleration + levelingAcceleration) *
+        ThinFilmMobility(hFace, wetFace) *
+        AxisGrainFactor(float2(0.0, 1.0));
+
+    float oldFaceVelocity = 0.5 * (velocityB.y + velocityT.y);
+    float relaxationRate = SurfaceResistancePerSecond(wetFace);
+    float response = 1.0 - exp(-relaxationRate * _DeltaTime);
+
+    faceVelocity = lerp(oldFaceVelocity, targetVelocity, response);
+    faceVelocity = ClampFaceVelocityForCFL(faceVelocity, dy);
+
+    float donorH;
+    float3 donorPigment;
+    float donorWetness;
+    float donorAge;
+
+    if (faceVelocity >= 0.0)
+    {
+        donorH = hB;
+        donorPigment = pigmentB;
+        donorWetness = wetB;
+        donorAge = ageB;
+    }
+    else
+    {
+        donorH = hT;
+        donorPigment = pigmentT;
+        donorWetness = wetT;
+        donorAge = ageT;
+    }
+
+    // A thin adhered residue must remain on the board. Only the film above this
+    // physical residual thickness is allowed to move. This prevents a tilted board
+    // from "washing clean" while still allowing a thick puddle to form a downhill tail.
+    float mobileH = max(0.0, donorH - max(0.0, _ResidualFilmThicknessMeters));
+    float mobileFraction = donorH > MIN_FILM_THICKNESS_METERS
+        ? saturate(mobileH / donorH)
+        : 0.0;
+
+    hFlux = faceVelocity * mobileH;
+    pigmentFlux = faceVelocity * donorPigment * mobileFraction;
+    wetnessFlux = faceVelocity * donorWetness * mobileFraction;
+    ageFlux = faceVelocity * donorAge * mobileFraction;
 }
 
 [numthreads(8, 8, 1)]
@@ -153,11 +381,11 @@ void KernelClearCanvas(uint3 id : SV_DispatchThreadID)
         return;
 
     int2 p = int2(id.xy);
-
-    _ColorWrite[p] = float4(0, 0, 0, 0);
-    _ThicknessWrite[p] = 0;
-    _WetnessWrite[p] = 0;
-    _VelocityWrite[p] = float2(0, 0);
+    _ColorWrite[p] = float4(0.0, 0.0, 0.0, 0.0);
+    _ThicknessWrite[p] = 0.0;
+    _WetnessWrite[p] = 0.0;
+    _AgeWrite[p] = 0.0;
+    _VelocityWrite[p] = float2(0.0, 0.0);
 }
 
 [numthreads(8, 8, 1)]
@@ -167,203 +395,106 @@ void KernelClearAccum(uint3 id : SV_DispatchThreadID)
         return;
 
     int2 p = int2(id.xy);
-
-    _AccumR[p] = 0;
-    _AccumG[p] = 0;
-    _AccumB[p] = 0;
-    _AccumWeight[p] = 0;
-    _AccumThickness[p] = 0;
-    _AccumWetness[p] = 0;
-    _AccumVelocityX[p] = 0;
-    _AccumVelocityY[p] = 0;
+    _AccumRWrite[p] = 0;
+    _AccumGWrite[p] = 0;
+    _AccumBWrite[p] = 0;
+    _AccumWeightWrite[p] = 0;
+    _AccumThicknessWrite[p] = 0;
+    _AccumWetnessWrite[p] = 0;
+    _AccumVelocityXWrite[p] = 0;
+    _AccumVelocityYWrite[p] = 0;
 }
 
 [numthreads(64, 1, 1)]
 void KernelDepositImpacts(uint id : SV_DispatchThreadID)
 {
-    uint impactCount = min(
-        _PaintImpactCount[0],
-        (uint)_MaximumImpacts
-    );
-
+    uint impactCount = min(_PaintImpactCount[0], (uint) _MaximumImpacts);
     if (id >= impactCount)
         return;
 
     PaintImpact impact = _PaintImpacts[id];
-
     float2 uv = saturate(impact.uvRadius.xy);
 
-    float radiusMeters =
-        max(0.00025, impact.uvRadius.z * _DepositionRadiusScale);
+    float2 cellSize = float2(
+        max(1e-6, _CanvasSizeMeters.x / max(1, _TextureResolution)),
+        max(1e-6, _CanvasSizeMeters.y / max(1, _TextureResolution))
+    );
 
-    float impactStrength =
-        max(0.05, impact.uvRadius.w);
+    float minimumRadiusMeters = MIN_DEPOSITION_RADIUS_PIXELS * max(cellSize.x, cellSize.y);
+    float radiusMeters = max(minimumRadiusMeters, max(0.00025, impact.uvRadius.z));
 
-    float2 tangentVelocity =
-        impact.tangentVelocity.xy;
+    float2 tangentVelocity = impact.tangentVelocity.xy;
+    float tangentSpeed = length(tangentVelocity);
+    float2 direction = float2(1.0, 0.0);
 
-    float tangentSpeed =
-        length(tangentVelocity);
+    if (tangentSpeed > 1e-5)
+        direction = tangentVelocity / tangentSpeed;
 
-    float2 direction =
-        tangentSpeed > 0.0001
-            ? tangentVelocity / tangentSpeed
-            : float2(1, 0);
+    float2 perpendicular = float2(-direction.y, direction.x);
+    float stretch = clamp(1.0 + tangentSpeed * _VelocityStretch, 1.0, 3.0);
+    float radiusAlong = radiusMeters * stretch;
+    float radiusAcross = radiusMeters;
 
-    float2 perpendicular =
-        float2(-direction.y, direction.x);
+    int2 centerPixel = int2(uv * _TextureResolution);
+    int extentX = (int) ceil(radiusAlong / cellSize.x) + 1;
+    int extentY = (int) ceil(radiusAlong / cellSize.y) + 1;
 
-    float stretch =
-        1.0 +
-        tangentSpeed *
-        _VelocityStretch;
+    // liters -> cubic meters
+    float volumeM3 = max(0.0, impact.colorAmount.w) * 0.001;
 
-    stretch = clamp(stretch, 1.0, 4.0);
-
-    float radiusPixelsX =
-        radiusMeters /
-        max(0.001, _CanvasSizeMeters.x) *
-        _TextureResolution;
-
-    float radiusPixelsY =
-        radiusMeters /
-        max(0.001, _CanvasSizeMeters.y) *
-        _TextureResolution;
-
-    int2 centerPixel =
-        int2(
-            uv *
-            _TextureResolution
-        );
-
-    int extentX =
-        (int)ceil(radiusPixelsX * stretch) + 1;
-
-    int extentY =
-        (int)ceil(radiusPixelsY * stretch) + 1;
-
-    float amountLiters =
-        max(0.0000001, impact.colorAmount.w);
-
-    float amountScale =
-        amountLiters *
-        _DepositionThicknessScale *
-        1000.0;
+    // Integral of t^2(3-2t) over an ellipse of radii a,b = 3*pi*a*b/10.
+    float kernelIntegralArea = max(1e-12, (3.0 * PI_VALUE / 10.0) * radiusAlong * radiusAcross);
 
     for (int y = -extentY; y <= extentY; y++)
     {
         for (int x = -extentX; x <= extentX; x++)
         {
-            int2 pixel =
-                centerPixel + int2(x, y);
-
+            int2 pixel = centerPixel + int2(x, y);
             if (!ValidPixel(pixel))
                 continue;
 
-            float2 pixelUv =
-                (float2(pixel) + 0.5) /
-                _TextureResolution;
+            float2 pixelUv = (float2(pixel) + 0.5) / _TextureResolution;
+            float2 deltaMeters = float2(
+                (pixelUv.x - uv.x) * _CanvasSizeMeters.x,
+                (pixelUv.y - uv.y) * _CanvasSizeMeters.y
+            );
 
-            float2 deltaMeters =
-                float2(
-                    (pixelUv.x - uv.x) *
-                    _CanvasSizeMeters.x,
+            float along = dot(deltaMeters, direction) / max(1e-8, radiusAlong);
+            float across = dot(deltaMeters, perpendicular) / max(1e-8, radiusAcross);
+            float radial = sqrt(along * along + across * across);
 
-                    (pixelUv.y - uv.y) *
-                    _CanvasSizeMeters.y
-                );
-
-            float along =
-                dot(deltaMeters, direction) /
-                (radiusMeters * stretch);
-
-            float across =
-                dot(deltaMeters, perpendicular) /
-                radiusMeters;
-
-            float normalizedDistance =
-                sqrt(along * along + across * across);
-
-            if (normalizedDistance >= 1.0)
+            if (radial >= 1.0)
                 continue;
 
-            float weight =
-                saturate(1.0 - normalizedDistance);
+            float t = 1.0 - radial;
+            float kernelWeight = t * t * (3.0 - 2.0 * t);
+            float thicknessMeters = volumeM3 * kernelWeight / kernelIntegralArea;
 
-            weight =
-                weight * weight *
-                (3.0 - 2.0 * weight);
+            if (thicknessMeters <= 0.0)
+                continue;
 
-            weight *= impactStrength;
+            uint fixedThickness = (uint) max(1.0, round(thicknessMeters * MASS_FIXED));
+            uint fixedR = (uint) max(0.0, round(saturate(impact.colorAmount.r) * fixedThickness));
+            uint fixedG = (uint) max(0.0, round(saturate(impact.colorAmount.g) * fixedThickness));
+            uint fixedB = (uint) max(0.0, round(saturate(impact.colorAmount.b) * fixedThickness));
+            uint fixedWetness = (uint) max(0.0, round(saturate(_DepositedWetness) * fixedThickness));
 
-            uint fixedWeight =
-                (uint)max(
-                    1.0,
-                    weight * COLOR_FIXED
-                );
-
-            uint fixedR =
-                (uint)max(
-                    0.0,
-                    saturate(impact.colorAmount.r) *
-                    fixedWeight
-                );
-
-            uint fixedG =
-                (uint)max(
-                    0.0,
-                    saturate(impact.colorAmount.g) *
-                    fixedWeight
-                );
-
-            uint fixedB =
-                (uint)max(
-                    0.0,
-                    saturate(impact.colorAmount.b) *
-                    fixedWeight
-                );
-
-            uint fixedThickness =
-                (uint)max(
-                    1.0,
-                    weight *
-                    amountScale *
-                    THICKNESS_FIXED
-                );
-
-            uint fixedWetness =
-                (uint)max(
-                    1.0,
-                    weight *
-                    _DepositedWetness *
-                    WETNESS_FIXED
-                );
-
-            int fixedVelocityX =
-                (int)(
-                    tangentVelocity.x *
-                    weight *
-                    VELOCITY_FIXED
-                );
-
-            int fixedVelocityY =
-                (int)(
-                    tangentVelocity.y *
-                    weight *
-                    VELOCITY_FIXED
-                );
+            uint fixedWeight = (uint) max(1.0, round(kernelWeight * IMPACT_WEIGHT_FIXED));
+            float clampedVX = clamp(tangentVelocity.x, -20.0, 20.0);
+            float clampedVY = clamp(tangentVelocity.y, -20.0, 20.0);
+            int fixedVelocityX = (int) round(clampedVX * fixedWeight * IMPACT_VELOCITY_FIXED);
+            int fixedVelocityY = (int) round(clampedVY * fixedWeight * IMPACT_VELOCITY_FIXED);
 
             uint oldU;
             int oldI;
-
-            InterlockedAdd(_AccumR[pixel], fixedR, oldU);
-            InterlockedAdd(_AccumG[pixel], fixedG, oldU);
-            InterlockedAdd(_AccumB[pixel], fixedB, oldU);
-            InterlockedAdd(_AccumWeight[pixel], fixedWeight, oldU);
-            InterlockedAdd(_AccumThickness[pixel], fixedThickness, oldU);
-            InterlockedAdd(_AccumWetness[pixel], fixedWetness, oldU);
-            InterlockedAdd(_AccumVelocityX[pixel], fixedVelocityX, oldI);
-            InterlockedAdd(_AccumVelocityY[pixel], fixedVelocityY, oldI);
+            InterlockedAdd(_AccumRWrite[pixel], fixedR, oldU);
+            InterlockedAdd(_AccumGWrite[pixel], fixedG, oldU);
+            InterlockedAdd(_AccumBWrite[pixel], fixedB, oldU);
+            InterlockedAdd(_AccumWeightWrite[pixel], fixedWeight, oldU);
+            InterlockedAdd(_AccumThicknessWrite[pixel], fixedThickness, oldU);
+            InterlockedAdd(_AccumWetnessWrite[pixel], fixedWetness, oldU);
+            InterlockedAdd(_AccumVelocityXWrite[pixel], fixedVelocityX, oldI);
+            InterlockedAdd(_AccumVelocityYWrite[pixel], fixedVelocityY, oldI);
         }
     }
 }
@@ -376,91 +507,69 @@ void KernelResolveDeposits(uint3 id : SV_DispatchThreadID)
 
     int2 p = int2(id.xy);
 
-    float4 oldColorValue = _ColorRead.Load(int3(p, 0));
-    float oldThickness = _ThicknessRead.Load(int3(p, 0));
-    float oldWetness = _WetnessRead.Load(int3(p, 0));
+    float oldH = max(0.0, _ThicknessRead.Load(int3(p, 0)));
+    float3 oldColor = saturate(_ColorRead.Load(int3(p, 0)).rgb);
+    float oldWetness = saturate(_WetnessRead.Load(int3(p, 0)));
+    float oldAge = max(0.0, _AgeRead.Load(int3(p, 0)));
     float2 oldVelocity = _VelocityRead.Load(int3(p, 0));
 
-    uint weightFixed = _AccumWeight[p];
+    uint incomingHFixed = _AccumThicknessRead[p];
 
-    if (weightFixed == 0)
+    if (incomingHFixed == 0)
     {
-        _ColorWrite[p] = oldColorValue;
-        _ThicknessWrite[p] = oldThickness;
+        _ColorWrite[p] = float4(oldColor, oldH > MIN_FILM_THICKNESS_METERS ? 1.0 : 0.0);
+        _ThicknessWrite[p] = oldH;
         _WetnessWrite[p] = oldWetness;
+        _AgeWrite[p] = oldAge;
         _VelocityWrite[p] = oldVelocity;
         return;
     }
 
-    float incomingWeight =
-        weightFixed / COLOR_FIXED;
+    float incomingH = incomingHFixed / MASS_FIXED;
+    float3 incomingPigmentAmount = float3(_AccumRRead[p], _AccumGRead[p], _AccumBRead[p]) / MASS_FIXED;
+    float incomingWetnessAmount = _AccumWetnessRead[p] / MASS_FIXED;
 
-    float3 incomingColor =
-        float3(
-            _AccumR[p],
-            _AccumG[p],
-            _AccumB[p]
-        ) /
-        max(1.0, (float)weightFixed);
+    float3 incomingColor = saturate(incomingPigmentAmount / max(MIN_FILM_THICKNESS_METERS, incomingH));
+    float incomingWetness = saturate(incomingWetnessAmount / max(MIN_FILM_THICKNESS_METERS, incomingH));
 
-    float incomingThickness =
-        _AccumThickness[p] /
-        THICKNESS_FIXED;
+    uint weightFixed = _AccumWeightRead[p];
+    float2 incomingVelocity = float2(0.0, 0.0);
 
-    float incomingWetness =
-        _AccumWetness[p] /
-        WETNESS_FIXED;
+    if (weightFixed > 0)
+    {
+        incomingVelocity =
+            float2(_AccumVelocityXRead[p], _AccumVelocityYRead[p]) /
+            (max(1.0, (float) weightFixed) * IMPACT_VELOCITY_FIXED);
+    }
 
-    float2 incomingVelocity =
-        float2(
-            _AccumVelocityX[p],
-            _AccumVelocityY[p]
-        ) /
-        VELOCITY_FIXED /
-        max(0.0001, incomingWeight);
+    float newH = oldH + incomingH;
 
-    float3 mixedColor =
-        oldThickness > 0.000001
-            ? SubtractiveMix(
-                oldColorValue.rgb,
-                oldThickness,
-                incomingColor,
-                incomingThickness
-            )
-            : incomingColor;
+    // Pigment mixing is subtractive (optical absorbance), not a simple RGB overwrite.
+    // New paint therefore mixes with old paint instead of visually erasing it.
+    float3 newColor = oldH > MIN_FILM_THICKNESS_METERS
+        ? MixPigmentsSubtractive(oldColor, oldH, incomingColor, incomingH)
+        : incomingColor;
 
-    float newThickness =
-        oldThickness +
-        incomingThickness;
+    float3 newPigmentAmount = newColor * newH;
+    float newWetnessAmount = oldWetness * oldH + incomingWetness * incomingH;
 
-    float newWetness =
-        saturate(
-            max(oldWetness, incomingWetness)
-        );
+    // Incoming paint is age 0, therefore only old paint contributes age mass.
+    float newAgeAmount = oldAge * oldH;
+    float newWetness = saturate(newWetnessAmount / max(MIN_FILM_THICKNESS_METERS, newH));
+    float newAge = max(0.0, newAgeAmount / max(MIN_FILM_THICKNESS_METERS, newH));
 
     float2 newVelocity =
-        (
-            oldVelocity *
-            oldThickness +
-            incomingVelocity *
-            incomingThickness
-        ) /
-        max(0.000001, newThickness);
+        (oldVelocity * oldH + incomingVelocity * incomingH) /
+        max(MIN_FILM_THICKNESS_METERS, newH);
 
-    _ColorWrite[p] =
-        float4(
-            mixedColor,
-            saturate(newThickness)
-        );
+    if (newAge < _DryingDelaySeconds)
+        newWetness = 1.0;
 
-    _ThicknessWrite[p] =
-        newThickness;
-
-    _WetnessWrite[p] =
-        newWetness;
-
-    _VelocityWrite[p] =
-        newVelocity;
+    _ColorWrite[p] = float4(newColor, 1.0);
+    _ThicknessWrite[p] = newH;
+    _WetnessWrite[p] = newWetness;
+    _AgeWrite[p] = newAge;
+    _VelocityWrite[p] = newVelocity;
 }
 
 [numthreads(8, 8, 1)]
@@ -471,164 +580,116 @@ void KernelSimulateSurface(uint3 id : SV_DispatchThreadID)
 
     int2 p = int2(id.xy);
 
-    float2 uv =
-        (float2(p) + 0.5) /
-        _TextureResolution;
+    float centerH, centerWetAmount, centerAgeAmount;
+    float3 centerPigmentAmount;
+    float2 centerVelocity;
+    ReadState(p, centerH, centerPigmentAmount, centerWetAmount, centerAgeAmount, centerVelocity);
 
-    float thickness =
-        _ThicknessRead.Load(int3(p, 0));
+    // IMPORTANT: do not early-return when centerH == 0.
+    // An empty destination cell must be able to receive flux from a wet neighbor.
 
-    if (thickness <= 0.0000001)
+    float leftHFlux, leftWetFlux, leftAgeFlux, leftFaceVelocity;
+    float3 leftPigmentFlux;
+    ComputeFaceFluxX(
+        p + int2(-1, 0), p,
+        leftHFlux, leftPigmentFlux, leftWetFlux, leftAgeFlux, leftFaceVelocity
+    );
+
+    float rightHFlux, rightWetFlux, rightAgeFlux, rightFaceVelocity;
+    float3 rightPigmentFlux;
+    ComputeFaceFluxX(
+        p, p + int2(1, 0),
+        rightHFlux, rightPigmentFlux, rightWetFlux, rightAgeFlux, rightFaceVelocity
+    );
+
+    float bottomHFlux, bottomWetFlux, bottomAgeFlux, bottomFaceVelocity;
+    float3 bottomPigmentFlux;
+    ComputeFaceFluxY(
+        p + int2(0, -1), p,
+        bottomHFlux, bottomPigmentFlux, bottomWetFlux, bottomAgeFlux, bottomFaceVelocity
+    );
+
+    float topHFlux, topWetFlux, topAgeFlux, topFaceVelocity;
+    float3 topPigmentFlux;
+    ComputeFaceFluxY(
+        p, p + int2(0, 1),
+        topHFlux, topPigmentFlux, topWetFlux, topAgeFlux, topFaceVelocity
+    );
+
+    float dx = max(1e-6, _CanvasSizeMeters.x / max(1, _TextureResolution));
+    float dy = max(1e-6, _CanvasSizeMeters.y / max(1, _TextureResolution));
+    float xScale = _DeltaTime / dx;
+    float yScale = _DeltaTime / dy;
+
+    float newH =
+        centerH -
+        xScale * (rightHFlux - leftHFlux) -
+        yScale * (topHFlux - bottomHFlux);
+
+    float3 newPigmentAmount =
+        centerPigmentAmount -
+        xScale * (rightPigmentFlux - leftPigmentFlux) -
+        yScale * (topPigmentFlux - bottomPigmentFlux);
+
+    float newWetnessAmount =
+        centerWetAmount -
+        xScale * (rightWetFlux - leftWetFlux) -
+        yScale * (topWetFlux - bottomWetFlux);
+
+    float newAgeAmount =
+        centerAgeAmount -
+        xScale * (rightAgeFlux - leftAgeFlux) -
+        yScale * (topAgeFlux - bottomAgeFlux);
+
+    newH = max(0.0, newH);
+    newPigmentAmount = max(float3(0.0, 0.0, 0.0), newPigmentAmount);
+    newWetnessAmount = max(0.0, newWetnessAmount);
+    newAgeAmount = max(0.0, newAgeAmount);
+
+    if (newH <= MIN_FILM_THICKNESS_METERS)
     {
-        _ColorWrite[p] = float4(0, 0, 0, 0);
-        _ThicknessWrite[p] = 0;
-        _WetnessWrite[p] = 0;
-        _VelocityWrite[p] = float2(0, 0);
+        _ColorWrite[p] = float4(0.0, 0.0, 0.0, 0.0);
+        _ThicknessWrite[p] = 0.0;
+        _WetnessWrite[p] = 0.0;
+        _AgeWrite[p] = 0.0;
+        _VelocityWrite[p] = float2(0.0, 0.0);
         return;
     }
 
-    float wetness =
-        _WetnessRead.Load(int3(p, 0));
+    // Keep pigment amount physically bounded by thickness to prevent numerical
+    // overshoot from turning into impossible RGB concentrations.
+    newPigmentAmount = min(newPigmentAmount, float3(newH, newH, newH));
+    newWetnessAmount = min(newWetnessAmount, newH);
 
-    float2 velocity =
-        _VelocityRead.Load(int3(p, 0));
+    float3 newColor = saturate(newPigmentAmount / newH);
+    float transportedWetness = saturate(newWetnessAmount / newH);
+    float previousAge = max(0.0, newAgeAmount / newH);
+    float newAge = previousAge + _DeltaTime;
 
-    float mobileWetness =
-        saturate(wetness) *
-        (1.0 - _SurfaceAdhesion);
+    float finalWetness;
 
-    velocity +=
-        _SurfaceGravityUV.xy *
-        _SurfaceMobility *
-        mobileWetness *
-        _DeltaTime;
+    if (newAge < _DryingDelaySeconds)
+    {
+        finalWetness = 1.0;
+    }
+    else
+    {
+        float dryingBefore = max(0.0, previousAge - _DryingDelaySeconds);
+        float dryingAfter = max(0.0, newAge - _DryingDelaySeconds);
+        float activeDryingDt = max(0.0, dryingAfter - dryingBefore);
+        float halfLife = max(1.0, _WetnessHalfLifeSeconds);
+        float decay = exp(-LN2 * activeDryingDt / halfLife);
+        finalWetness = saturate(transportedWetness * decay);
+    }
 
-    float2 grain =
-        normalize(
-            _WoodGrainDirection.xy +
-            float2(0.0001, 0)
-        );
+    float2 cellVelocity = float2(
+        0.5 * (leftFaceVelocity + rightFaceVelocity),
+        0.5 * (bottomFaceVelocity + topFaceVelocity)
+    );
 
-    float grainVelocity =
-        dot(velocity, grain);
-
-    float2 acrossGrain =
-        velocity -
-        grain * grainVelocity;
-
-    velocity =
-        grain * grainVelocity +
-        acrossGrain *
-        (1.0 - _WoodGrainAnisotropy);
-
-    float damping =
-        exp(
-            -(
-                2.0 +
-                _SurfaceAdhesion * 10.0 +
-                _SurfaceAbsorption * 4.0
-            ) *
-            _DeltaTime
-        );
-
-    velocity *= damping;
-
-    float2 backUv =
-        uv -
-        velocity *
-        _DeltaTime;
-
-    float4 advectedColor =
-        SampleColor(backUv);
-
-    float advectedThickness =
-        SampleThickness(backUv);
-
-    float advectedWetness =
-        SampleWetness(backUv);
-
-    float2 advectedVelocity =
-        SampleVelocity(backUv);
-
-    float2 texel =
-        1.0 /
-        _TextureResolution;
-
-    float4 neighborColor =
-        (
-            SampleColor(uv + float2(texel.x, 0)) +
-            SampleColor(uv - float2(texel.x, 0)) +
-            SampleColor(uv + float2(0, texel.y)) +
-            SampleColor(uv - float2(0, texel.y))
-        ) * 0.25;
-
-    float neighborThickness =
-        (
-            SampleThickness(uv + float2(texel.x, 0)) +
-            SampleThickness(uv - float2(texel.x, 0)) +
-            SampleThickness(uv + float2(0, texel.y)) +
-            SampleThickness(uv - float2(0, texel.y))
-        ) * 0.25;
-
-    float diffusionAmount =
-        saturate(
-            _SurfaceDiffusion *
-            advectedWetness *
-            _DeltaTime *
-            12.0
-        );
-
-    float4 finalColor =
-        lerp(
-            advectedColor,
-            neighborColor,
-            diffusionAmount
-        );
-
-    float finalThickness =
-        lerp(
-            advectedThickness,
-            neighborThickness,
-            diffusionAmount * 0.55
-        );
-
-    float finalWetness =
-        max(
-            0.0,
-            advectedWetness -
-            (
-                _SurfaceEvaporation +
-                _SurfaceAbsorption * 0.04
-            ) *
-            _DeltaTime
-        );
-
-    float absorbedFraction =
-        saturate(
-            _SurfaceAbsorption *
-            _DeltaTime *
-            0.25
-        );
-
-    finalThickness =
-        lerp(
-            finalThickness,
-            max(finalThickness, thickness),
-            absorbedFraction
-        );
-
-    _ColorWrite[p] =
-        float4(
-            finalColor.rgb,
-            saturate(finalThickness)
-        );
-
-    _ThicknessWrite[p] =
-        max(0.0, finalThickness);
-
-    _WetnessWrite[p] =
-        saturate(finalWetness);
-
-    _VelocityWrite[p] =
-        advectedVelocity * damping;
+    _ColorWrite[p] = float4(newColor, 1.0);
+    _ThicknessWrite[p] = newH;
+    _WetnessWrite[p] = finalWetness;
+    _AgeWrite[p] = newAge;
+    _VelocityWrite[p] = cellVelocity;
 }

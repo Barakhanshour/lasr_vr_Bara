@@ -10,22 +10,11 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
         RecolorEverything
     }
 
-    public enum PaintCanvasSurfaceType
-    {
-        Cloth,
-        Wood,
-        Glass,
-        Custom
-    }
-
     [Header("References")]
     public SwingingBucketStage01 bucketStage01;
     public PaintEmitterStage02 paintEmitterStage02;
     public Transform bucketRoot;
     public Transform paintExitPoint;
-
-    [Tooltip("Point the local Y-axis dead straight from the canvas towards the bucket.")]
-    public Transform paintCanvasSurface;
 
     [Header("GPU Assets")]
     public ComputeShader fluidCompute;
@@ -80,33 +69,6 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
     [Range(1.0f, 3.0f)]
     public float streamRenderRadiusScale = 1.25f;
 
-    [Header("Paint Canvas")]
-    public Vector2 canvasSizeMeters = new Vector2(2.0f, 2.0f);
-
-    [Range(0.0001f, 0.01f)]
-    public float canvasSurfaceOffsetMeters = 0.0012f;
-
-    public PaintCanvasSurfaceType canvasSurfaceType = PaintCanvasSurfaceType.Cloth;
-
-    [Header("Custom Canvas Properties")]
-    [Range(0.0f, 1.0f)]
-    public float customCanvasAdhesion = 0.96f;
-
-    [Range(0.0f, 2.0f)]
-    public float customCanvasFlowMobility = 0.025f;
-
-    [Range(0.0f, 5.0f)]
-    public float customImpactSpread = 0.80f;
-
-    [Range(0.0f, 1.0f)]
-    public float customTangentialDamping = 0.55f;
-
-    [Range(1.0f, 8.0f)]
-    public float depositedRadiusScale = 1.90f;
-
-    [Range(0.0f, 1.0f)]
-    public float edgeReleaseSpeed = 0.04f;
-
     [Header("Runtime Paint Color")]
     public RuntimePaintColorMode runtimeColorMode = RuntimePaintColorMode.NewPaintOnly;
 
@@ -123,6 +85,14 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
     [SerializeField] private float volumePerParticleLiters;
     [SerializeField] private float currentFlowLitersPerSecond;
     [SerializeField] private int currentDrainParticleBudget;
+
+    [Header("Canvas Mapping Runtime Debug")]
+    [SerializeField] private Vector3 resolvedCanvasCenterWorld;
+    [SerializeField] private Vector2 resolvedCanvasSizeMeters;
+    [SerializeField] private Vector2 resolvedCanvasVisualWorldSize;
+    [SerializeField] private Vector3 resolvedCanvasAxisUWorld;
+    [SerializeField] private Vector3 resolvedCanvasAxisVWorld;
+    [SerializeField] private Vector3 resolvedCanvasNormalWorld;
 
     private const int THREADS = 256;
     private const float LITERS_TO_CUBIC_METERS = 0.001f;
@@ -242,8 +212,6 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
         gridResolution = Mathf.Clamp(gridResolution, 32, 128);
         particleVisualRadius = Mathf.Clamp(particleVisualRadius, 0.001f, 0.012f);
         solverSubsteps = Mathf.Clamp(solverSubsteps, 1, 4);
-        canvasSizeMeters.x = Mathf.Max(0.01f, canvasSizeMeters.x);
-        canvasSizeMeters.y = Mathf.Max(0.01f, canvasSizeMeters.y);
         statisticsReadbackInterval = Mathf.Clamp(statisticsReadbackInterval, 0.05f, 0.5f);
         maximumPaintImpactsPerFrame = Mathf.Clamp(
             maximumPaintImpactsPerFrame,
@@ -327,9 +295,20 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
             return false;
         }
 
-        if (paintCanvasSurface == null)
+        if (paintCanvasStage04 == null)
         {
-            Debug.LogError("GpuDensityPaintFluidStage03: Paint Canvas Surface is missing.");
+            Debug.LogError(
+                "GpuDensityPaintFluidStage03: PaintCanvasStage04 is missing. " +
+                "Stage 04 is the single source of truth for canvas size, surface type and canvas mapping."
+            );
+            return false;
+        }
+
+        if (paintCanvasStage04.canvasRenderer == null && paintCanvasStage04.canvasSurface == null)
+        {
+            Debug.LogError(
+                "GpuDensityPaintFluidStage03: Stage 04 has no canvas surface / renderer assigned."
+            );
             return false;
         }
 
@@ -970,7 +949,12 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
         fluidCompute.SetFloat("_DrainInfluenceRadius", drainInfluenceRadius);
         fluidCompute.SetFloat("_DrainInfluenceHeight", drainInfluenceHeight);
         fluidCompute.SetFloat("_StreamRenderRadiusScale", streamRenderRadiusScale);
-        fluidCompute.SetFloat("_DepositedRadiusScale", depositedRadiusScale);
+        fluidCompute.SetFloat(
+            "_DepositedRadiusScale",
+            paintCanvasStage04 != null
+                ? paintCanvasStage04.depositedParticleRadiusScale
+                : 1.90f
+        );
         fluidCompute.SetFloat("_ExitSpeed", exitSpeed);
         fluidCompute.SetFloat("_SimulationTime", Time.time);
 
@@ -986,41 +970,117 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
         fluidCompute.SetMatrix("_BucketLocalToWorld", bucketRoot.localToWorldMatrix);
         fluidCompute.SetMatrix("_BucketWorldToLocal", bucketRoot.worldToLocalMatrix);
 
-        fluidCompute.SetFloat("_HasCanvas", paintCanvasSurface != null ? 1.0f : 0.0f);
-
-        if (paintCanvasSurface != null)
-        {
-            fluidCompute.SetMatrix(
-                "_CanvasLocalToWorld",
-                paintCanvasSurface.localToWorldMatrix
-            );
-            fluidCompute.SetMatrix(
-                "_CanvasWorldToLocal",
-                paintCanvasSurface.worldToLocalMatrix
-            );
-            fluidCompute.SetVector("_CanvasPositionWorld", paintCanvasSurface.position);
-            fluidCompute.SetVector("_CanvasNormalWorld", paintCanvasSurface.up.normalized);
-        }
-
-        fluidCompute.SetVector(
-            "_CanvasHalfSize",
-            new Vector4(
-                canvasSizeMeters.x * 0.5f,
-                canvasSizeMeters.y * 0.5f,
-                0,
-                0
-            )
+        bool hasResolvedCanvas = TryResolveCanvasFrame(
+            out PaintCanvasStage04.CanvasFrame canvasFrame
         );
-        fluidCompute.SetFloat("_CanvasSurfaceOffset", canvasSurfaceOffsetMeters);
+
+        fluidCompute.SetFloat("_HasCanvas", hasResolvedCanvas ? 1.0f : 0.0f);
+
+        if (hasResolvedCanvas)
+        {
+            // Physical canvas coordinates are authoritative, while the visible mesh may
+            // have any local/world size. These scale factors map the full visible mesh
+            // to exactly canvasSizeMeters from PaintCanvasStage04.
+            float worldUnitsPerMeterU =
+                canvasFrame.worldHalfWidth /
+                Mathf.Max(0.000001f, canvasFrame.halfWidthMeters);
+
+            float worldUnitsPerMeterV =
+                canvasFrame.worldHalfHeight /
+                Mathf.Max(0.000001f, canvasFrame.halfHeightMeters);
+
+            Matrix4x4 canvasLocalToWorld = Matrix4x4.identity;
+            canvasLocalToWorld.SetColumn(0, new Vector4(
+                canvasFrame.axisUWorld.x * worldUnitsPerMeterU,
+                canvasFrame.axisUWorld.y * worldUnitsPerMeterU,
+                canvasFrame.axisUWorld.z * worldUnitsPerMeterU,
+                0.0f
+            ));
+            canvasLocalToWorld.SetColumn(1, new Vector4(
+                canvasFrame.normalWorld.x,
+                canvasFrame.normalWorld.y,
+                canvasFrame.normalWorld.z,
+                0.0f
+            ));
+            canvasLocalToWorld.SetColumn(2, new Vector4(
+                canvasFrame.axisVWorld.x * worldUnitsPerMeterV,
+                canvasFrame.axisVWorld.y * worldUnitsPerMeterV,
+                canvasFrame.axisVWorld.z * worldUnitsPerMeterV,
+                0.0f
+            ));
+            canvasLocalToWorld.SetColumn(3, new Vector4(
+                canvasFrame.centerWorld.x,
+                canvasFrame.centerWorld.y,
+                canvasFrame.centerWorld.z,
+                1.0f
+            ));
+
+            Matrix4x4 canvasWorldToLocal = canvasLocalToWorld.inverse;
+
+            fluidCompute.SetMatrix("_CanvasLocalToWorld", canvasLocalToWorld);
+            fluidCompute.SetMatrix("_CanvasWorldToLocal", canvasWorldToLocal);
+            fluidCompute.SetVector("_CanvasPositionWorld", canvasFrame.centerWorld);
+            fluidCompute.SetVector("_CanvasNormalWorld", canvasFrame.normalWorld);
+            fluidCompute.SetVector(
+                "_CanvasHalfSize",
+                new Vector4(
+                    canvasFrame.halfWidthMeters,
+                    canvasFrame.halfHeightMeters,
+                    0.0f,
+                    0.0f
+                )
+            );
+
+            resolvedCanvasCenterWorld = canvasFrame.centerWorld;
+            resolvedCanvasSizeMeters = new Vector2(
+                canvasFrame.WidthMeters,
+                canvasFrame.HeightMeters
+            );
+            resolvedCanvasVisualWorldSize = new Vector2(
+                canvasFrame.worldHalfWidth * 2.0f,
+                canvasFrame.worldHalfHeight * 2.0f
+            );
+            resolvedCanvasAxisUWorld = canvasFrame.axisUWorld;
+            resolvedCanvasAxisVWorld = canvasFrame.axisVWorld;
+            resolvedCanvasNormalWorld = canvasFrame.normalWorld;
+        }
+        else
+        {
+            resolvedCanvasSizeMeters = Vector2.zero;
+            resolvedCanvasVisualWorldSize = Vector2.zero;
+        }
+        fluidCompute.SetFloat(
+            "_CanvasSurfaceOffset",
+            paintCanvasStage04 != null
+                ? paintCanvasStage04.surfaceOffsetMeters
+                : 0.0012f
+        );
         fluidCompute.SetFloat("_CanvasAdhesion", adhesion);
         fluidCompute.SetFloat("_CanvasFlowMobility", flowMobility);
         fluidCompute.SetFloat("_CanvasImpactSpread", impactSpread);
         fluidCompute.SetFloat("_CanvasTangentialDamping", tangentialDamping);
-        fluidCompute.SetFloat("_EdgeReleaseSpeed", edgeReleaseSpeed);
+        fluidCompute.SetFloat(
+            "_EdgeReleaseSpeed",
+            paintCanvasStage04 != null
+                ? paintCanvasStage04.edgeReleaseSpeed
+                : 0.04f
+        );
         fluidCompute.SetFloat(
             "_UseStage04CanvasPainting",
             paintCanvasStage04 != null ? 1.0f : 0.0f
         );
+    }
+
+    private bool TryResolveCanvasFrame(
+        out PaintCanvasStage04.CanvasFrame frame
+    )
+    {
+        frame = default;
+
+        if (paintCanvasStage04 == null)
+            return false;
+
+        return paintCanvasStage04.TryGetCanvasFrame(out frame);
     }
 
     private void GetCanvasSurfaceParameters(
@@ -1030,36 +1090,21 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
         out float tangentialDamping
     )
     {
-        switch (canvasSurfaceType)
+        if (paintCanvasStage04 != null)
         {
-            case PaintCanvasSurfaceType.Cloth:
-                adhesion = 0.96f;
-                flowMobility = 0.035f;
-                impactSpread = 1.35f;
-                tangentialDamping = 0.55f;
-                break;
-
-            case PaintCanvasSurfaceType.Wood:
-                adhesion = 0.79f;
-                flowMobility = 0.16f;
-                impactSpread = 1.65f;
-                tangentialDamping = 0.78f;
-                break;
-
-            case PaintCanvasSurfaceType.Glass:
-                adhesion = 0.16f;
-                flowMobility = 0.92f;
-                impactSpread = 2.25f;
-                tangentialDamping = 0.96f;
-                break;
-
-            default:
-                adhesion = customCanvasAdhesion;
-                flowMobility = customCanvasFlowMobility;
-                impactSpread = customImpactSpread;
-                tangentialDamping = customTangentialDamping;
-                break;
+            paintCanvasStage04.GetParticleImpactSurfaceParameters(
+                out adhesion,
+                out flowMobility,
+                out impactSpread,
+                out tangentialDamping
+            );
+            return;
         }
+
+        adhesion = 0.80f;
+        flowMobility = 0.14f;
+        impactSpread = 1.65f;
+        tangentialDamping = 0.78f;
     }
 
     private void TryUpdateParticleStatistics()
@@ -1168,24 +1213,38 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
         }
 
         particleSplatMaterial.SetBuffer("_Particles", particleBuffer);
-        particleSplatMaterial.SetMatrix("_BucketLocalToWorld", bucketRoot.localToWorldMatrix);
-        particleSplatMaterial.SetMatrix("_CanvasLocalToWorld", paintCanvasSurface.localToWorldMatrix);
+        particleSplatMaterial.SetMatrix(
+            "_BucketLocalToWorld",
+            bucketRoot.localToWorldMatrix
+        );
         particleSplatMaterial.SetFloat("_ParticleScale", 1.10f);
         particleSplatMaterial.SetFloat("_InsideAlpha", 0.055f);
         particleSplatMaterial.SetFloat("_AirborneAlpha", 0.94f);
         particleSplatMaterial.SetFloat("_DepositedAlpha", 0.98f);
 
-        Vector3 center =
-            (bucketRoot.position + paintCanvasSurface.position) * 0.5f;
+        Vector3 canvasCenter =
+            resolvedCanvasSizeMeters.sqrMagnitude > 0.0f
+                ? resolvedCanvasCenterWorld
+                : bucketRoot.position;
+
+        Vector3 center = (bucketRoot.position + canvasCenter) * 0.5f;
 
         float distance = Vector3.Distance(
             bucketRoot.position,
-            paintCanvasSurface.position
+            canvasCenter
         );
+
+        float resolvedMaximumCanvasSize =
+            resolvedCanvasVisualWorldSize.sqrMagnitude > 0.0f
+                ? Mathf.Max(
+                    resolvedCanvasVisualWorldSize.x,
+                    resolvedCanvasVisualWorldSize.y
+                )
+                : 2.0f;
 
         float boundsSize = Mathf.Max(
             20.0f,
-            distance + Mathf.Max(canvasSizeMeters.x, canvasSizeMeters.y) + 10.0f
+            distance + resolvedMaximumCanvasSize + 10.0f
         );
 
         Bounds bounds = new Bounds(center, Vector3.one * boundsSize);
@@ -1257,28 +1316,36 @@ public class GpuDensityPaintFluidStage03 : MonoBehaviour
 
     private void OnDrawGizmosSelected()
     {
-        if (paintCanvasSurface == null)
+        if (!TryResolveCanvasFrame(out PaintCanvasStage04.CanvasFrame frame))
             return;
 
-        Matrix4x4 previousMatrix = Gizmos.matrix;
         Color previousColor = Gizmos.color;
 
-        Gizmos.matrix = paintCanvasSurface.localToWorldMatrix;
-        Gizmos.color = new Color(0.1f, 0.8f, 1.0f, 0.85f);
+        Vector3 center = frame.centerWorld + frame.normalWorld * 0.003f;
+        Vector3 u = frame.axisUWorld * frame.worldHalfWidth;
+        Vector3 v = frame.axisVWorld * frame.worldHalfHeight;
 
-        Gizmos.DrawWireCube(
-            Vector3.zero,
-            new Vector3(
-                canvasSizeMeters.x,
-                0.002f,
-                canvasSizeMeters.y
-            )
-        );
+        Vector3 p0 = center - u - v;
+        Vector3 p1 = center + u - v;
+        Vector3 p2 = center + u + v;
+        Vector3 p3 = center - u + v;
+
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawLine(p0, p1);
+        Gizmos.DrawLine(p1, p2);
+        Gizmos.DrawLine(p2, p3);
+        Gizmos.DrawLine(p3, p0);
+
+        Gizmos.color = Color.red;
+        Gizmos.DrawLine(center - u, center + u);
+
+        Gizmos.color = Color.blue;
+        Gizmos.DrawLine(center - v, center + v);
 
         Gizmos.color = Color.green;
-        Gizmos.DrawLine(Vector3.zero, Vector3.up * 0.25f);
+        Gizmos.DrawLine(center, center + frame.normalWorld * 0.30f);
 
-        Gizmos.matrix = previousMatrix;
         Gizmos.color = previousColor;
     }
+
 }
