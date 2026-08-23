@@ -305,12 +305,6 @@ public class ExperimentSaveResultsController : MonoBehaviour
             data.surfaceTypeName = canvasStage.surfaceType.ToString();
             data.canvasSizeMeters = canvasStage.canvasSizeMeters;
         }
-        else if (fluidStage != null)
-        {
-            data.surfaceTypeIndex = (int)fluidStage.canvasSurfaceType;
-            data.surfaceTypeName = fluidStage.canvasSurfaceType.ToString();
-            data.canvasSizeMeters = fluidStage.canvasSizeMeters;
-        }
 
         if (boardTiltController != null)
         {
@@ -380,8 +374,6 @@ public class ExperimentSaveResultsController : MonoBehaviour
 
         if (fluidStage != null)
         {
-            fluidStage.canvasSurfaceType = (GpuDensityPaintFluidStage03.PaintCanvasSurfaceType)surfaceIndex;
-            fluidStage.canvasSizeMeters = safeCanvasSize;
             fluidStage.particleCount = Mathf.Clamp(data.particleCount, 50000, 2000000);
             fluidStage.gridResolution = Mathf.Clamp(data.gridResolution, 32, 128);
         }
@@ -732,7 +724,7 @@ public class ExperimentSaveResultsController : MonoBehaviour
 
         Vector2 canvasSize = canvasStage != null
             ? canvasStage.canvasSizeMeters
-            : fluidStage != null ? fluidStage.canvasSizeMeters : Vector2.zero;
+            : Vector2.zero;
 
         float paintedArea = canvasSize.x * canvasSize.y * latestCoveragePercent * 0.01f;
         string surfaceName = canvasStage != null ? canvasStage.surfaceType.ToString() : "Unknown";

@@ -104,7 +104,7 @@ public class SwingingPaintBucketUI : MonoBehaviour
     private int pendingParticleCount;
     private int pendingGridResolution;
     private float configuredPaintVolumeLiters;
-   // private bool isSavingImage;
+    // private bool isSavingImage;
     private enum ExperimentState
     {
         Ready,
@@ -148,10 +148,10 @@ public class SwingingPaintBucketUI : MonoBehaviour
         if (Application.isPlaying)
         {
             BuildUI();
-            PrepareReadyState(); 
+            PrepareReadyState();
             SetSetupControlsInteractable(true);
         }
-    
+
     }
     void CacheCanvasVisualSettings()
     {
@@ -189,12 +189,6 @@ public class SwingingPaintBucketUI : MonoBehaviour
         if (canvasStage != null)
         {
             canvasStage.canvasSizeMeters =
-                size;
-        }
-
-        if (fluidStage != null)
-        {
-            fluidStage.canvasSizeMeters =
                 size;
         }
 
@@ -264,7 +258,7 @@ public class SwingingPaintBucketUI : MonoBehaviour
         leftVLG.spacing = 12;
         leftVLG.childAlignment = TextAnchor.UpperLeft;
         leftVLG.childControlWidth = true;
-        leftVLG.childControlHeight =  true;
+        leftVLG.childControlHeight = true;
         leftVLG.childForceExpandWidth = true;
         leftVLG.childForceExpandHeight = false;
 
@@ -279,12 +273,12 @@ public class SwingingPaintBucketUI : MonoBehaviour
     typeof(ScrollRect),
     typeof(LayoutElement)
 );
-scrollObj.transform.SetParent(
-    leftPanel,
-    false
-);
+        scrollObj.transform.SetParent(
+            leftPanel,
+            false
+        );
 
-scrollObj.transform.SetSiblingIndex(1);
+        scrollObj.transform.SetSiblingIndex(1);
 
         RectTransform scrollRT =
             scrollObj.GetComponent<RectTransform>();
@@ -818,9 +812,9 @@ scrollObj.transform.SetSiblingIndex(1);
             key == "particleCount" ||
             key == "gridResolution"
         )
-                {
-                    slider.wholeNumbers = true;
-                }
+        {
+            slider.wholeNumbers = true;
+        }
         // Background
         GameObject bg = new GameObject("Background", typeof(Image));
         bg.transform.SetParent(sliderObj.transform, false);
@@ -1058,14 +1052,6 @@ scrollObj.transform.SetSiblingIndex(1);
         {
             canvasStage.surfaceType =
                 (PaintCanvasStage04.SurfaceType)
-                currentSurfaceTypeIndex;
-        }
-
-        if (fluidStage != null)
-        {
-            fluidStage.canvasSurfaceType =
-                (GpuDensityPaintFluidStage03
-                    .PaintCanvasSurfaceType)
                 currentSurfaceTypeIndex;
         }
     }
@@ -1654,7 +1640,7 @@ StopExperiment
             );
         }
         if (bucketStage01 != null)
-        { 
+        {
             SetSlider(
                     "bucketMass",
                     bucketStage01.bucketDryMassKg,
@@ -2596,7 +2582,7 @@ StopExperiment
 
         if (fluidStage != null)
         {
-         //   if (liveTexts.ContainsKey("particles")) liveTexts["particles"].text = fluidStage.ActiveParticleCount.ToString();
+            if (liveTexts.ContainsKey("particles")) liveTexts["particles"].text = fluidStage.ActiveParticleCount.ToString();
             if (liveTexts.ContainsKey("paintVol")) liveTexts["paintVol"].text = fluidStage.CalculatedPaintVolumeLiters.ToString("F3");
             if (liveTexts.ContainsKey("flow")) liveTexts["flow"].text = fluidStage.CurrentFlowLitersPerSecond.ToString("F3");
         }

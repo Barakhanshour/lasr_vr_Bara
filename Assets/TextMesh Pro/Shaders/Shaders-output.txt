@@ -1,0 +1,144 @@
+====================================================================================================
+PROJECT EXPORT FOR LLMs
+====================================================================================================
+
+PROJECT INFORMATION:
+--------------------------------------------------
+Project Name: Shaders
+Generated On: 2026-08-23 08:31:25 (Asia/Damascus / GMT+03:00)
+Total Files Processed: 47
+Export Tool: Easy Whole Project to Single Text File for LLMs v1.1.0
+Tool Author: Jota / José Guilherme Pandolfi
+
+EXPORT CONFIGURATION:
+--------------------------------------------------
+Language: en
+Max File Size: 1 MB
+Include Hidden Files: false
+Output Format: txt
+Notification Level: minimal
+Custom File Name Pattern: {workspaceName}-output
+
+================================================================================
+PROJECT STRUCTURE
+================================================================================
+├── 📄 SDFFunctions.hlsl (5.88 KB)
+├── 📄 SDFFunctions.hlsl.meta (230 B)
+├── 📄 Shaders-output.txt.meta (158 B)
+├── 📄 TMP_Bitmap-Custom-Atlas.shader (3.81 KB)
+├── 📄 TMP_Bitmap-Custom-Atlas.shader.meta (204 B)
+├── 📄 TMP_Bitmap-Mobile.shader (3.98 KB)
+├── 📄 TMP_Bitmap-Mobile.shader.meta (204 B)
+├── 📄 TMP_Bitmap.shader (3.75 KB)
+├── 📄 TMP_Bitmap.shader.meta (204 B)
+├── 📄 TMP_SDF Overlay.shader (10.79 KB)
+├── 📄 TMP_SDF Overlay.shader.meta (204 B)
+├── 📄 TMP_SDF SSD.shader (12.15 KB)
+├── 📄 TMP_SDF SSD.shader.meta (204 B)
+├── 📄 TMP_SDF-HDRP LIT.shadergraph (280.69 KB)
+├── 📄 TMP_SDF-HDRP LIT.shadergraph.meta (285 B)
+├── 📄 TMP_SDF-HDRP UNLIT.shadergraph (273.35 KB)
+├── 📄 TMP_SDF-HDRP UNLIT.shadergraph.meta (285 B)
+├── 📄 TMP_SDF-Mobile Masking.shader (8.08 KB)
+├── 📄 TMP_SDF-Mobile Masking.shader.meta (204 B)
+├── 📄 TMP_SDF-Mobile Overlay.shader (7.89 KB)
+├── 📄 TMP_SDF-Mobile Overlay.shader.meta (204 B)
+├── 📄 TMP_SDF-Mobile SSD.shader (2.99 KB)
+├── 📄 TMP_SDF-Mobile SSD.shader.meta (204 B)
+├── 📄 TMP_SDF-Mobile-2-Pass.shader (11.52 KB)
+├── 📄 TMP_SDF-Mobile-2-Pass.shader.meta (204 B)
+├── 📄 TMP_SDF-Mobile.shader (7.88 KB)
+├── 📄 TMP_SDF-Mobile.shader.meta (204 B)
+├── 📄 TMP_SDF-Surface-Mobile.shader (3.44 KB)
+├── 📄 TMP_SDF-Surface-Mobile.shader.meta (204 B)
+├── 📄 TMP_SDF-Surface.shader (4.25 KB)
+├── 📄 TMP_SDF-Surface.shader.meta (204 B)
+├── 📄 TMP_SDF-URP Lit.shadergraph (277.21 KB)
+├── 📄 TMP_SDF-URP Lit.shadergraph.meta (285 B)
+├── 📄 TMP_SDF-URP Unlit.shadergraph (270.52 KB)
+├── 📄 TMP_SDF-URP Unlit.shadergraph.meta (285 B)
+├── 📄 TMP_SDF.shader (10.77 KB)
+├── 📄 TMP_SDF.shader.meta (204 B)
+├── 📄 TMP_Sprite.shader (3.37 KB)
+├── 📄 TMP_Sprite.shader.meta (204 B)
+├── 📄 TMPro_Mobile.cginc (5.33 KB)
+├── 📄 TMPro_Mobile.cginc.meta (204 B)
+├── 📄 TMPro_Properties.cginc (2.64 KB)
+├── 📄 TMPro_Properties.cginc.meta (204 B)
+├── 📄 TMPro_Surface.cginc (3.43 KB)
+├── 📄 TMPro_Surface.cginc.meta (204 B)
+├── 📄 TMPro.cginc (2.22 KB)
+└── 📄 TMPro.cginc.meta (215 B)
+
+================================================================================
+PROJECT STATISTICS
+================================================================================
+Total Files: 47
+Total Directories: 0
+Text Files: 0
+Binary Files: 47
+Total Size: 1.19 MB
+
+FILE TYPES DISTRIBUTION:
+------------------------------
+.meta           : 24
+.shader         : 14
+.shadergraph    : 4
+.cginc          : 4
+.hlsl           : 1
+
+================================================================================
+FILE CODE CONTENTS
+================================================================================
+
+
+================================================================================
+BINARY/EXCLUDED FILES (not included in text content)
+================================================================================
+- SDFFunctions.hlsl
+- SDFFunctions.hlsl.meta
+- Shaders-output.txt.meta
+- TMP_Bitmap-Custom-Atlas.shader
+- TMP_Bitmap-Custom-Atlas.shader.meta
+- TMP_Bitmap-Mobile.shader
+- TMP_Bitmap-Mobile.shader.meta
+- TMP_Bitmap.shader
+- TMP_Bitmap.shader.meta
+- TMP_SDF Overlay.shader
+- TMP_SDF Overlay.shader.meta
+- TMP_SDF SSD.shader
+- TMP_SDF SSD.shader.meta
+- TMP_SDF-HDRP LIT.shadergraph
+- TMP_SDF-HDRP LIT.shadergraph.meta
+- TMP_SDF-HDRP UNLIT.shadergraph
+- TMP_SDF-HDRP UNLIT.shadergraph.meta
+- TMP_SDF-Mobile Masking.shader
+- TMP_SDF-Mobile Masking.shader.meta
+- TMP_SDF-Mobile Overlay.shader
+- TMP_SDF-Mobile Overlay.shader.meta
+- TMP_SDF-Mobile SSD.shader
+- TMP_SDF-Mobile SSD.shader.meta
+- TMP_SDF-Mobile-2-Pass.shader
+- TMP_SDF-Mobile-2-Pass.shader.meta
+- TMP_SDF-Mobile.shader
+- TMP_SDF-Mobile.shader.meta
+- TMP_SDF-Surface-Mobile.shader
+- TMP_SDF-Surface-Mobile.shader.meta
+- TMP_SDF-Surface.shader
+- TMP_SDF-Surface.shader.meta
+- TMP_SDF-URP Lit.shadergraph
+- TMP_SDF-URP Lit.shadergraph.meta
+- TMP_SDF-URP Unlit.shadergraph
+- TMP_SDF-URP Unlit.shadergraph.meta
+- TMP_SDF.shader
+- TMP_SDF.shader.meta
+- TMP_Sprite.shader
+- TMP_Sprite.shader.meta
+- TMPro_Mobile.cginc
+- TMPro_Mobile.cginc.meta
+- TMPro_Properties.cginc
+- TMPro_Properties.cginc.meta
+- TMPro_Surface.cginc
+- TMPro_Surface.cginc.meta
+- TMPro.cginc
+- TMPro.cginc.meta
